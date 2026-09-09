@@ -26,7 +26,8 @@ const start = async () => {
       process.exit(0);
     });
 
-    // Force-kill if graceful shutdown takes too long (Render default SIGTERM window is ~30 s)
+    // Force-kill if graceful shutdown takes too long.
+    // AWS ECS / Elastic Beanstalk default SIGTERM window is 30 s.
     setTimeout(() => {
       console.error('❌ Graceful shutdown timed out. Forcing exit.');
       process.exit(1);

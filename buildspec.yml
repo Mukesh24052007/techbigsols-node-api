@@ -1,0 +1,76 @@
+# ── AWS CodeBuild build specification ────────────────────────────────────────
+# Used by CodePipeline (source → build → deploy) or standalone CodeBuild.
+# Supports two deployment paths:
+#   1. Docker image → ECR → ECS / Elastic Beanstalk (Docker platform)
+#   2. Zip artefact → S3 → Elastic Beanstalk (Node.js platform) / CodeDeploy EC2
+#
+# Required CodeBuild environment variables:
+#   AWS_ACCOUNT_ID   — your 12-digit AWS account ID
+#   AWS_REGION       — e.g. us-east-1
+#   ECR_REPO_NAME    — ECR repository name (e.g. techbigsolutions-node-api)
+#   IMAGE_TAG        — optional, defaults to the CodeBuild resolved source version
+
+version: 0.2
+
+env:
+  variables:
+    NODE_ENV: production
+  # Uncomment to pull secrets from Parameter Store at build time (for unit tests etc.)
+  # parameter-store:
+  #   DB_HOST: /techbigsols/prod/DB_HOST
+
+phases:
+  install:
+    runtime-versions:
+      nodejs: 20
+    commands:
+      - echo "==> Installing dependencies..."
+      - npm ci --omit=dev
+
+  pre_build:
+    commands:
+      - echo "==> Logging in to Amazon ECR..."
+      - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+      - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c1-7)
+      - IMAGE_TAG=${IMAGE_TAG:-$COMMIT_HASH}
+      - ECR_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO_NAME
+
+  build:
+    commands:
+      - echo "==> Building Docker image..."
+      - docker build -t $ECR_URI:latest -t $ECR_URI:$IMAGE_TAG .
+      - echo "==> Build completed on $(date)"
+
+  post_build:
+    commands:
+      - echo "==> Pushing image to ECR..."
+      - docker push $ECR_URI:latest
+      - docker push $ECR_URI:$IMAGE_TAG
+
+      # Write the image definitions file used by ECS CodePipeline deploy action
+      - echo "==> Writing imagedefinitions.json..."
+      - printf '[{"name":"techbigsolutions-node-api","imageUri":"%s"}]' "$ECR_URI:$IMAGE_TAG" > imagedefinitions.json
+
+      # Also write imageDetail.json for ECS blue/green (CodeDeployToECS action)
+      - printf '{"ImageURI":"%s"}' "$ECR_URI:$IMAGE_TAG" > imageDetail.json
+
+      - echo "==> Post-build completed."
+
+artifacts:
+  files:
+    - imagedefinitions.json
+    - imageDetail.json
+    - appspec.yml
+    - scripts/**/*
+  # Uncomment the lines below if deploying the raw source to EB (non-Docker)
+  # secondary-artifacts:
+  #   eb-bundle:
+  #     files:
+  #       - "**/*"
+  #     exclude-paths:
+  #       - ".git/**"
+  #       - "node_modules/**"
+
+cache:
+  paths:
+    - node_modules/**/*   # speeds up subsequent builds

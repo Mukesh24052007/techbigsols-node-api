@@ -11,10 +11,11 @@ const pool = mysql.createPool({
   waitForConnections: true,
   connectionLimit: Number(process.env.DB_CONNECTION_LIMIT) || 10,
   queueLimit: 0,
-  // In production, require SSL (e.g. PlanetScale, Aiven, Railway, etc.)
+  // In production, enable SSL (required by PlanetScale, Aiven, Railway, etc.)
   // Set DB_SSL=false explicitly to disable (e.g. for self-hosted MySQL without SSL)
+  // DB_SSL=reject to enforce certificate verification (strict mode)
   ...(isProduction && process.env.DB_SSL !== 'false' && {
-    ssl: { rejectUnauthorized: true },
+    ssl: { rejectUnauthorized: process.env.DB_SSL === 'reject' },
   }),
 });
 

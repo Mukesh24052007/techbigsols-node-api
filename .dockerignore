@@ -1,0 +1,26 @@
+# Dependencies — reinstalled inside the image
+node_modules
+
+# Environment files — secrets are injected at runtime via AWS Secrets Manager / Parameter Store
+.env
+.env.*
+!.env.example
+
+# Git
+.git
+.gitignore
+
+# Editor / OS artefacts
+.DS_Store
+*.log
+npm-debug.log*
+
+# CI / deployment configs not needed inside the image
+.github
+.kiro
+appspec.yml
+buildspec.yml
+Dockerfile
+.dockerignore
+render.yaml
+README.md
