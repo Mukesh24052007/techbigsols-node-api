@@ -65,9 +65,12 @@ const migrate = async () => {
     console.log('✅ Migration complete: reviews_count column removed');
 
     // site_users — users managed through the admin user-master portal
+    // user_id uses the format tbusr001, tbusr002, … generated in application code
+
+    // Create the table fresh if it doesn't exist yet
     await pool.query(`
       CREATE TABLE IF NOT EXISTS site_users (
-        id            INT AUTO_INCREMENT PRIMARY KEY,
+        user_id       VARCHAR(20)   NOT NULL PRIMARY KEY,
         fullname      VARCHAR(150)  NOT NULL,
         email         VARCHAR(150)  NOT NULL UNIQUE,
         password      VARCHAR(255)  NOT NULL,
@@ -77,6 +80,84 @@ const migrate = async () => {
         updated_at    TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
       )
     `);
+
+    // --- Schema upgrade: migrate old `id INT` column to `user_id VARCHAR` ---
+    // Check whether the legacy `id` column still exists
+    const [legacyCols] = await pool.query(`
+      SELECT COLUMN_NAME
+      FROM INFORMATION_SCHEMA.COLUMNS
+      WHERE TABLE_SCHEMA = DATABASE()
+        AND TABLE_NAME   = 'site_users'
+        AND COLUMN_NAME  = 'id'
+    `);
+
+    if (legacyCols.length > 0) {
+      console.log('⚙️  Upgrading site_users: replacing id column with user_id …');
+
+      // Check which columns already exist so each step is idempotent (safe to re-run)
+      const [allCols] = await pool.query(`
+        SELECT COLUMN_NAME
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME   = 'site_users'
+      `);
+      const colNames = allCols.map((c) => c.COLUMN_NAME);
+
+      const hasUserIdCol = colNames.includes('user_id');
+      const hasIdCol     = colNames.includes('id');
+
+      // Step 1 — Strip AUTO_INCREMENT from id so we can demote it from PK
+      if (hasIdCol) {
+        await pool.query(`ALTER TABLE site_users MODIFY COLUMN id INT NOT NULL`);
+        console.log('  ✓ AUTO_INCREMENT removed from id');
+      }
+
+      // Step 2 — Drop the old primary key if one still exists
+      const [pkRows] = await pool.query(`
+        SELECT CONSTRAINT_NAME
+        FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS
+        WHERE TABLE_SCHEMA    = DATABASE()
+          AND TABLE_NAME      = 'site_users'
+          AND CONSTRAINT_TYPE = 'PRIMARY KEY'
+      `);
+      if (pkRows.length > 0) {
+        await pool.query(`ALTER TABLE site_users DROP PRIMARY KEY`);
+        console.log('  ✓ Old primary key dropped');
+      }
+
+      // Step 3 — Add user_id column only if it was not added by a previous run
+      if (!hasUserIdCol) {
+        await pool.query(`ALTER TABLE site_users ADD COLUMN user_id VARCHAR(20) NULL`);
+        console.log('  ✓ user_id column added');
+      }
+
+      // Step 4 — Backfill user_id from old numeric id where still empty
+      if (hasIdCol) {
+        await pool.query(`
+          UPDATE site_users
+          SET user_id = CONCAT('tbusr', LPAD(id, 3, '0'))
+          WHERE user_id IS NULL OR user_id = ''
+        `);
+        console.log('  ✓ user_id values backfilled');
+      }
+
+      // Step 5 — Promote user_id to NOT NULL primary key
+      await pool.query(`
+        ALTER TABLE site_users
+          MODIFY COLUMN user_id VARCHAR(20) NOT NULL,
+          ADD PRIMARY KEY (user_id)
+      `);
+      console.log('  ✓ user_id set as primary key');
+
+      // Step 6 — Drop the old id column
+      if (hasIdCol) {
+        await pool.query(`ALTER TABLE site_users DROP COLUMN id`);
+        console.log('  ✓ Old id column dropped');
+      }
+
+      console.log('✅ site_users schema upgrade complete: user_id is now the primary key');
+    }
+
     console.log('✅ Migration complete: site_users table ready');
 
     process.exit(0);

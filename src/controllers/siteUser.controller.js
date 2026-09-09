@@ -16,12 +16,13 @@ const SiteUserController = {
   },
 
   /**
-   * GET /api/user-master/:id
+   * GET /api/user-master/:userId
    * Returns a single site-user (admin only).
+   * Example: GET /api/user-master/tbusr001
    */
   async getOne(req, res, next) {
     try {
-      const user = await SiteUserModel.findById(req.params.id);
+      const user = await SiteUserModel.findById(req.params.userId);
       if (!user) {
         return res.status(404).json({ success: false, message: 'Site user not found.' });
       }
@@ -35,6 +36,7 @@ const SiteUserController = {
    * POST /api/user-master
    * Create a new site-user (admin only).
    * Body: { fullname, email, password, moduleAccess: string[] }
+   * The userId (tbusr001, tbusr002, …) is generated automatically.
    */
   async create(req, res, next) {
     try {
@@ -89,13 +91,15 @@ const SiteUserController = {
   },
 
   /**
-   * PUT /api/user-master/:id
+   * PUT /api/user-master/:userId
    * Update a site-user (admin only).
+   * Example: PUT /api/user-master/tbusr001
    * Body: any subset of { fullname, email, password, moduleAccess, is_active }
    */
   async update(req, res, next) {
     try {
       const { fullname, email, password, moduleAccess, is_active } = req.body;
+      const { userId } = req.params;
 
       // Validate moduleAccess if provided
       if (moduleAccess !== undefined) {
@@ -119,7 +123,7 @@ const SiteUserController = {
       // If email is changing, ensure it's not already taken by another user
       if (email !== undefined) {
         const existing = await SiteUserModel.findByEmail(email);
-        if (existing && String(existing.id) !== String(req.params.id)) {
+        if (existing && existing.user_id !== userId) {
           return res.status(409).json({
             success: false,
             message: 'This email is already in use by another site user.',
@@ -133,7 +137,7 @@ const SiteUserController = {
         hashedPassword = await bcrypt.hash(password, 12);
       }
 
-      const updated = await SiteUserModel.update(req.params.id, {
+      const updated = await SiteUserModel.update(userId, {
         fullname,
         email,
         password: hashedPassword,
@@ -152,12 +156,13 @@ const SiteUserController = {
   },
 
   /**
-   * DELETE /api/user-master/:id
+   * DELETE /api/user-master/:userId
    * Delete a site-user (admin only).
+   * Example: DELETE /api/user-master/tbusr001
    */
   async remove(req, res, next) {
     try {
-      const deleted = await SiteUserModel.remove(req.params.id);
+      const deleted = await SiteUserModel.remove(req.params.userId);
       if (!deleted) {
         return res.status(404).json({ success: false, message: 'Site user not found.' });
       }

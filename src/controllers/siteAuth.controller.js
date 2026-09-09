@@ -9,7 +9,7 @@ const SiteUserModel = require('../models/siteUser.model');
  */
 const signSiteUserToken = (user) => {
   return jwt.sign(
-    { id: user.id, email: user.email, type: 'site_user' },
+    { userId: user.user_id, email: user.email, type: 'site_user' },
     process.env.JWT_SECRET,
     { expiresIn: process.env.JWT_EXPIRES_IN || '1d' }
   );
@@ -62,7 +62,7 @@ const SiteAuthController = {
         message: 'Login successful.',
         token,
         user: {
-          id: user.id,
+          userId: user.user_id,
           fullname: user.fullname,
           email: user.email,
           moduleAccess: user.moduleAccess,

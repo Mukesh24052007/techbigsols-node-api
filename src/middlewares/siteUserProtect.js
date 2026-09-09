@@ -42,7 +42,7 @@ const siteUserProtect = async (req, res, next) => {
     }
 
     // Confirm the site-user still exists and is active
-    const siteUser = await SiteUserModel.findById(decoded.id);
+    const siteUser = await SiteUserModel.findById(decoded.userId);
     if (!siteUser) {
       return res.status(401).json({
         success: false,
