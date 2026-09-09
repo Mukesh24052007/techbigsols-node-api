@@ -1,3 +1,23 @@
+# Dependencies
 node_modules/
+
+# Environment secrets — never commit real values
 .env
+.env.local
+.env.*.local
+
+# Logs
 *.log
+logs/
+npm-debug.log*
+
+# OS / editor artefacts
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Build output (if added later)
+dist/
+build/
+

@@ -17,6 +17,10 @@
   "author": "",
   "license": "ISC",
   "type": "commonjs",
+  "engines": {
+    "node": ">=20.0.0",
+    "npm": ">=10.0.0"
+  },
   "bugs": {
     "url": "https://github.com/Mukesh24052007/techbigsols-node-api/issues"
   },

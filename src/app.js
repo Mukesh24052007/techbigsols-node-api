@@ -13,13 +13,22 @@ const { notFound, errorHandler } = require('./middlewares/error.middleware');
 
 const app = express();
 
+// Build allowed-origins list from env (comma-separated) with local fallback
+const rawOrigins = process.env.ALLOWED_ORIGINS || 'http://localhost:3000';
+const allowedOrigins = rawOrigins.split(',').map((o) => o.trim()).filter(Boolean);
+
 // Security & utility middleware
 app.use(helmet());
 app.use(cors({
-  origin: 'http://localhost:3000',
+  origin: (origin, callback) => {
+    // Allow server-to-server / curl requests (no Origin header)
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    return callback(new Error(`CORS: origin '${origin}' not allowed`));
+  },
   credentials: true,
 }));
-app.use(morgan('dev'));
+app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
