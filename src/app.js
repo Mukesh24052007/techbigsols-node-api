@@ -32,6 +32,16 @@ app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// Root route — required by AWS Elastic Beanstalk ALB health checker
+// EB pings GET / and expects a 200 OK before marking the environment healthy.
+app.get('/', (req, res) => {
+  res.status(200).json({
+    status: 'ok',
+    service: 'techbigsolutions-node-api',
+    timestamp: new Date().toISOString(),
+  });
+});
+
 // Routes
 app.use('/api/health', healthRoutes);
 app.use('/api/users', userRoutes);
