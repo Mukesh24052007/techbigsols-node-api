@@ -13,9 +13,11 @@ const { notFound, errorHandler } = require('./middlewares/error.middleware');
 
 const app = express();
 
-// Build allowed-origins list from env (comma-separated) with local fallback
-const rawOrigins = process.env.ALLOWED_ORIGINS || 'http://localhost:3000';
-const allowedOrigins = rawOrigins.split(',').map((o) => o.trim()).filter(Boolean);
+// Allowed CORS origins
+const allowedOrigins = [
+  'https://techbigsolutions.in',
+  'https://www.techbigsolutions.in',
+];
 
 // Security & utility middleware
 app.use(helmet());
