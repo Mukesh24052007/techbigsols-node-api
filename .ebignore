@@ -1,0 +1,40 @@
+# ── Elastic Beanstalk bundle exclusions ──────────────────────────────────────
+# EB zips your project and uploads it. This file controls what is EXCLUDED.
+# Anything not listed here IS included in the bundle.
+# Syntax is identical to .gitignore.
+
+# ── Never include secrets ────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Dev dependencies & local installs ───────────────────────────────────────
+# EB runs "npm install --omit=dev" on the instance — don't ship node_modules
+node_modules/
+
+# ── Git history ──────────────────────────────────────────────────────────────
+.git/
+.gitignore
+
+# ── Docker artefacts (not needed on EB Node.js platform) ────────────────────
+Dockerfile
+.dockerignore
+
+# ── CI / CD pipeline files ───────────────────────────────────────────────────
+buildspec.yml
+appspec.yml
+scripts/
+
+# ── Editor / OS artefacts ────────────────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
+logs/
+
+# ── Local EB CLI config (machine-specific, not needed in bundle) ─────────────
+.elasticbeanstalk/
+
+# ── Misc ─────────────────────────────────────────────────────────────────────
+README.md

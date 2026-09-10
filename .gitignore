@@ -21,3 +21,8 @@ Thumbs.db
 dist/
 build/
 
+# EB CLI workspace state — machine-specific, not needed in git
+# config.yml is safe to commit (no secrets); the rest is not
+.elasticbeanstalk/*
+!.elasticbeanstalk/config.yml
+

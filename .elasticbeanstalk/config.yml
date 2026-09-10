@@ -1,0 +1,33 @@
+# ── EB CLI configuration ──────────────────────────────────────────────────────
+# Generated for: techbigsolutions-node-api
+# This file is machine-specific. It is excluded from the deployment bundle
+# via .ebignore, but you CAN commit it to git so the whole team shares the
+# same app name, region and platform. The environment name is intentionally
+# left out — each developer/pipeline targets their own env via `eb use`.
+#
+# First-time setup on a new machine:
+#   1. Install EB CLI:  pip install awsebcli
+#   2. Configure AWS:   aws configure
+#   3. Run:             eb use techbigsolutions-prod
+#   4. Deploy:          eb deploy
+
+global:
+  application_name: techbigsolutions-node-api
+  default_region: ap-south-1          # Mumbai — change if your AWS region differs
+  default_platform: "Node.js 20"
+  profile: default                    # matches the [default] profile in ~/.aws/credentials
+  workspace_type: Application
+
+# ── Branch-to-environment mapping ────────────────────────────────────────────
+# "eb deploy" automatically targets the right environment based on git branch.
+branch-defaults:
+  main:
+    environment: techbigsolutions-prod
+    group_suffix: null
+  develop:
+    environment: techbigsolutions-staging  # create this env when you need staging
+    group_suffix: null
+
+# ── Deploy settings ───────────────────────────────────────────────────────────
+deploy:
+  artifact: null    # set to a zip path to deploy a pre-built bundle instead of source
