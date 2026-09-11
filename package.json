@@ -7,6 +7,8 @@
     "start": "node src/server.js",
     "dev": "nodemon src/server.js",
     "migrate": "node src/config/migrate.js",
+    "seed": "node src/config/seed.js",
+    "migrate:seed": "node src/config/migrate.js && node src/config/seed.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "repository": {
