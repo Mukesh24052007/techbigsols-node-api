@@ -194,6 +194,224 @@ const migrate = async () => {
       console.log('✅ site_users schema upgrade complete');
     }
 
+    // ── 5. Attendance module ─────────────────────────────────────────────────
+    // No foreign keys to site_users: deleting a site-user must keep working
+    // and payroll history must survive. Indexed user_id + fullname snapshot.
+    // DATETIME (not TIMESTAMP) so values are timezone-naive UTC strings.
+    const attendanceTables = [
+      {
+        name: 'attendance_offices',
+        sql: `
+          CREATE TABLE IF NOT EXISTS attendance_offices (
+            id                         INT AUTO_INCREMENT PRIMARY KEY,
+            name                       VARCHAR(150)  NOT NULL,
+            lat                        DECIMAL(10,7) NOT NULL,
+            lng                        DECIMAL(10,7) NOT NULL,
+            radius_m                   INT           NOT NULL DEFAULT 150,
+            accuracy_max_m             INT           NOT NULL DEFAULT 50,
+            ip_allowlist               JSON          DEFAULT NULL,
+            require_both               TINYINT(1)    NOT NULL DEFAULT 0,
+            shift_start                TIME          NOT NULL DEFAULT '09:30:00',
+            shift_end                  TIME          NOT NULL DEFAULT '18:30:00',
+            grace_minutes              INT           NOT NULL DEFAULT 15,
+            outside_tolerance_minutes  INT           NOT NULL DEFAULT 10,
+            heartbeat_seconds          INT           NOT NULL DEFAULT 60,
+            reverify_count             INT           NOT NULL DEFAULT 2,
+            created_at                 DATETIME      NOT NULL,
+            updated_at                 DATETIME      NOT NULL
+          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        `,
+      },
+      {
+        name: 'attendance_profiles',
+        sql: `
+          CREATE TABLE IF NOT EXISTS attendance_profiles (
+            user_id          VARCHAR(20)  NOT NULL PRIMARY KEY,
+            department       VARCHAR(100) DEFAULT NULL,
+            designation      VARCHAR(100) DEFAULT NULL,
+            office_id        INT          DEFAULT NULL,
+            shift_start      TIME         DEFAULT NULL,
+            shift_end        TIME         DEFAULT NULL,
+            face_template    VARBINARY(1024) DEFAULT NULL,
+            face_enrolled_at DATETIME     DEFAULT NULL,
+            consent_at       DATETIME     DEFAULT NULL,
+            consent_version  VARCHAR(32)  DEFAULT NULL,
+            created_at       DATETIME     NOT NULL,
+            updated_at       DATETIME     NOT NULL,
+            INDEX idx_att_profiles_office (office_id)
+          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        `,
+      },
+      {
+        name: 'attendance_records',
+        sql: `
+          CREATE TABLE IF NOT EXISTS attendance_records (
+            id                  INT AUTO_INCREMENT PRIMARY KEY,
+            user_id             VARCHAR(20)  NOT NULL,
+            attendance_date     DATE         NOT NULL,
+            fullname            VARCHAR(150) NOT NULL,
+            office_id           INT          DEFAULT NULL,
+            check_in_at         DATETIME     DEFAULT NULL,
+            check_out_at        DATETIME     DEFAULT NULL,
+            status              ENUM('PRESENT','LATE','AUTO_CHECKOUT','ABSENT') NOT NULL DEFAULT 'ABSENT',
+            worked_minutes      INT          NOT NULL DEFAULT 0,
+            check_in_lat        DECIMAL(10,7) DEFAULT NULL,
+            check_in_lng        DECIMAL(10,7) DEFAULT NULL,
+            check_in_accuracy   DECIMAL(8,2)  DEFAULT NULL,
+            ip                  VARCHAR(45)  DEFAULT NULL,
+            created_at          DATETIME     NOT NULL,
+            updated_at          DATETIME     NOT NULL,
+            UNIQUE KEY uq_att_records_user_date (user_id, attendance_date),
+            INDEX idx_att_records_date (attendance_date),
+            INDEX idx_att_records_office (office_id),
+            INDEX idx_att_records_status (attendance_date, status)
+          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        `,
+      },
+      {
+        name: 'attendance_presence',
+        sql: `
+          CREATE TABLE IF NOT EXISTS attendance_presence (
+            record_id          INT          NOT NULL PRIMARY KEY,
+            user_id            VARCHAR(20)  NOT NULL,
+            state              ENUM('INSIDE','OUTSIDE','UNKNOWN') NOT NULL DEFAULT 'INSIDE',
+            last_heartbeat_at  DATETIME     DEFAULT NULL,
+            last_inside_at     DATETIME     DEFAULT NULL,
+            outside_since      DATETIME     DEFAULT NULL,
+            last_lat           DECIMAL(10,7) DEFAULT NULL,
+            last_lng           DECIMAL(10,7) DEFAULT NULL,
+            last_accuracy      DECIMAL(8,2)  DEFAULT NULL,
+            updated_at         DATETIME     NOT NULL,
+            INDEX idx_att_presence_user (user_id),
+            INDEX idx_att_presence_state (state)
+          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        `,
+      },
+      {
+        name: 'attendance_intervals',
+        sql: `
+          CREATE TABLE IF NOT EXISTS attendance_intervals (
+            id          INT AUTO_INCREMENT PRIMARY KEY,
+            record_id   INT          NOT NULL,
+            state       ENUM('INSIDE','OUTSIDE','UNKNOWN') NOT NULL,
+            started_at  DATETIME     NOT NULL,
+            ended_at    DATETIME     DEFAULT NULL,
+            INDEX idx_att_intervals_record (record_id, ended_at)
+          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        `,
+      },
+      {
+        name: 'attendance_challenges',
+        sql: `
+          CREATE TABLE IF NOT EXISTS attendance_challenges (
+            id          CHAR(36)     NOT NULL PRIMARY KEY,
+            user_id     VARCHAR(20)  NOT NULL,
+            purpose     ENUM('checkin','reverify') NOT NULL,
+            action      VARCHAR(32)  NOT NULL,
+            issued_at   DATETIME     NOT NULL,
+            expires_at  DATETIME     NOT NULL,
+            used_at     DATETIME     DEFAULT NULL,
+            INDEX idx_att_challenges_user (user_id, purpose, issued_at)
+          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        `,
+      },
+      {
+        name: 'attendance_attempts',
+        sql: `
+          CREATE TABLE IF NOT EXISTS attendance_attempts (
+            id              INT AUTO_INCREMENT PRIMARY KEY,
+            user_id         VARCHAR(20)  NOT NULL,
+            kind            VARCHAR(32)  NOT NULL,
+            success         TINYINT(1)   NOT NULL DEFAULT 0,
+            distance_score  DECIMAL(8,6) DEFAULT NULL,
+            accuracy        DECIMAL(8,2) DEFAULT NULL,
+            ip              VARCHAR(45)  DEFAULT NULL,
+            reason          VARCHAR(255) DEFAULT NULL,
+            created_at      DATETIME     NOT NULL,
+            INDEX idx_att_attempts_user_created (user_id, created_at),
+            INDEX idx_att_attempts_kind (kind, created_at)
+          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        `,
+      },
+      {
+        name: 'attendance_reverify_tasks',
+        sql: `
+          CREATE TABLE IF NOT EXISTS attendance_reverify_tasks (
+            id            INT AUTO_INCREMENT PRIMARY KEY,
+            record_id     INT          NOT NULL,
+            user_id       VARCHAR(20)  NOT NULL,
+            scheduled_at  DATETIME     NOT NULL,
+            due_at        DATETIME     NOT NULL,
+            completed_at  DATETIME     DEFAULT NULL,
+            status        ENUM('PENDING','COMPLETED','MISSED','CANCELLED') NOT NULL DEFAULT 'PENDING',
+            INDEX idx_att_reverify_record (record_id),
+            INDEX idx_att_reverify_due (status, due_at),
+            INDEX idx_att_reverify_user (user_id, scheduled_at)
+          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        `,
+      },
+      {
+        name: 'attendance_regularizations',
+        sql: `
+          CREATE TABLE IF NOT EXISTS attendance_regularizations (
+            id               INT AUTO_INCREMENT PRIMARY KEY,
+            user_id          VARCHAR(20)  NOT NULL,
+            attendance_date  DATE         NOT NULL,
+            reason           TEXT         NOT NULL,
+            status           ENUM('PENDING','APPROVED','REJECTED') NOT NULL DEFAULT 'PENDING',
+            reviewed_by      INT          DEFAULT NULL,
+            reviewed_at      DATETIME     DEFAULT NULL,
+            created_at       DATETIME     NOT NULL,
+            INDEX idx_att_reg_user_date (user_id, attendance_date),
+            INDEX idx_att_reg_status (status)
+          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        `,
+      },
+      {
+        name: 'attendance_leaves',
+        sql: `
+          CREATE TABLE IF NOT EXISTS attendance_leaves (
+            id           INT AUTO_INCREMENT PRIMARY KEY,
+            user_id      VARCHAR(20)  NOT NULL,
+            leave_date   DATE         NOT NULL,
+            reason       VARCHAR(500) DEFAULT NULL,
+            status       ENUM('PENDING','APPROVED','REJECTED') NOT NULL DEFAULT 'PENDING',
+            reviewed_by  INT          DEFAULT NULL,
+            reviewed_at  DATETIME     DEFAULT NULL,
+            created_at   DATETIME     NOT NULL,
+            UNIQUE KEY uq_att_leaves_user_date (user_id, leave_date),
+            INDEX idx_att_leaves_date_status (leave_date, status)
+          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        `,
+      },
+      {
+        name: 'attendance_audit_log',
+        sql: `
+          CREATE TABLE IF NOT EXISTS attendance_audit_log (
+            id              INT AUTO_INCREMENT PRIMARY KEY,
+            actor_admin_id  INT          NOT NULL,
+            action          VARCHAR(64)  NOT NULL,
+            entity_type     VARCHAR(64)  NOT NULL,
+            entity_id       VARCHAR(64)  NOT NULL,
+            before_json     JSON         DEFAULT NULL,
+            after_json      JSON         DEFAULT NULL,
+            created_at      DATETIME     NOT NULL,
+            INDEX idx_att_audit_entity (entity_type, entity_id),
+            INDEX idx_att_audit_created (created_at)
+          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        `,
+      },
+    ];
+
+    for (const table of attendanceTables) {
+      try {
+        await pool.query(table.sql);
+        console.log(`✅ ${table.name} table ready`);
+      } catch (err) {
+        console.warn(`⚠️  ${table.name}:`, err.message);
+      }
+    }
+
     console.log('\n🎉 All migrations completed successfully.');
     process.exit(0);
 

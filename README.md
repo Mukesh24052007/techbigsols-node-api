@@ -13,7 +13,26 @@ npm run migrate             # create tables
 npm run dev                 # starts with nodemon
 ```
 
+Set `PORT=5000` in `.env` so this API does not collide with the Next.js
+dev server on port 3000.
+
 Health check: `GET /api/health`
+
+---
+
+## Attendance
+
+Face ID + office geofence + live presence. Employee routes live under
+`/api/attendance` (site-user JWT + Attendance module). Admin routes live
+under `/api/attendance/admin` (admin JWT).
+
+Local stub: `GET /api/attendance/ping`
+
+Non-production CORS also allows `http://localhost:3000` and
+`http://127.0.0.1:3000`. Optional extra origins:
+`EXTRA_ALLOWED_ORIGINS=http://localhost:3001`
+
+See `ATTENDANCE_API.md` (added in a later phase) for the full contract.
 
 ---
 
