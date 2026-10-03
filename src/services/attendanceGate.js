@@ -2,7 +2,7 @@ const crypto = require('crypto');
 const { pool } = require('../config/db');
 const { evaluateLocation } = require('../utils/geo');
 const { decryptEmbedding } = require('../utils/crypto');
-const { euclideanDistance, descriptorsIdentical, matchThreshold } = require('../utils/faceMath');
+const { euclideanDistance, descriptorsIdentical, matchThreshold, minPairwiseDistance, replayEpsilon } = require('../utils/faceMath');
 const { httpError } = require('../utils/attendanceValidate');
 const { toUtcDateTime, fromUtcDateTime, istCalendarDate, istDateTimeToUtc } = require('../utils/time');
 const AttendanceOfficeModel = require('../models/attendanceOffice.model.js');
@@ -147,8 +147,14 @@ async function loadAndValidateChallenge({ challengeId, userId, purpose }) {
 }
 
 function assertLivenessDescriptors(descriptors) {
-  if (descriptorsIdentical(descriptors)) {
-    throw httpError(400, 'Liveness failed: face samples look identical (possible photo replay).');
+  const min = minPairwiseDistance(descriptors);
+  const eps = replayEpsilon();
+  if (min < eps) {
+    const err = httpError(400, 'Liveness failed: face samples look identical (possible photo replay).');
+    err.attemptReason = `replay_detected:min_dist=${min.toFixed(6)}`;
+    err.reason = err.attemptReason;
+    err.distanceScore = Number.isFinite(min) ? Number(min.toFixed(6)) : null;
+    throw err;
   }
 }
 

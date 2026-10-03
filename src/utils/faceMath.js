@@ -14,24 +14,28 @@ function averageDescriptors(list) {
     for (let i = 0; i < dim; i += 1) acc[i] += item[i];
   }
   const n = list.length;
-  const avg = acc.map((v) => v / n);
-  let norm = 0;
-  for (const v of avg) norm += v * v;
-  norm = Math.sqrt(norm);
-  if (norm > 0) {
-    for (let i = 0; i < dim; i += 1) avg[i] /= norm;
-  }
-  return avg;
+  return acc.map((v) => v / n);
 }
 
-function descriptorsIdentical(list, eps = 1e-5) {
-  for (let i = 1; i < list.length; i += 1) {
-    if (euclideanDistance(list[0], list[i]) < eps) return true;
+function minPairwiseDistance(list) {
+  if (!Array.isArray(list) || list.length < 2) return Infinity;
+  let min = Infinity;
+  for (let i = 0; i < list.length; i += 1) {
+    for (let j = i + 1; j < list.length; j += 1) {
+      const d = euclideanDistance(list[i], list[j]);
+      if (d < min) min = d;
+    }
   }
-  for (let i = 1; i < list.length - 1; i += 1) {
-    if (euclideanDistance(list[i], list[i + 1]) < eps) return true;
-  }
-  return false;
+  return min;
+}
+
+function replayEpsilon() {
+  const n = Number(process.env.FACE_REPLAY_EPSILON);
+  return Number.isFinite(n) && n > 0 ? n : 0.004;
+}
+
+function descriptorsIdentical(list, eps = replayEpsilon()) {
+  return minPairwiseDistance(list) < eps;
 }
 
 function matchThreshold() {
@@ -42,6 +46,9 @@ function matchThreshold() {
 module.exports = {
   euclideanDistance,
   averageDescriptors,
+  minPairwiseDistance,
+  replayEpsilon,
   descriptorsIdentical,
   matchThreshold,
 };
+

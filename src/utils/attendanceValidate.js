@@ -50,9 +50,15 @@ function assertDescriptors(value, count, label = 'descriptors') {
 function clientIp(req) {
   const xf = req.headers['x-forwarded-for'];
   if (typeof xf === 'string' && xf.trim()) {
-    return xf.split(',')[0].trim().slice(0, 45);
+    const parts = xf.split(',').map((p) => p.trim()).filter(Boolean);
+    if (parts.length > 0) {
+      const hopsSetting = parseInt(process.env.TRUSTED_PROXY_HOPS, 10);
+      const hops = Number.isFinite(hopsSetting) && hopsSetting > 0 ? hopsSetting : 1;
+      const idx = Math.max(0, parts.length - hops);
+      return parts[idx].slice(0, 45);
+    }
   }
-  const ip = req.ip || req.socket?.remoteAddress || '';
+  const ip = req.socket?.remoteAddress || req.ip || '';
   return String(ip).slice(0, 45);
 }
 

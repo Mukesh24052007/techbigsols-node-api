@@ -213,7 +213,7 @@ const migrate = async () => {
             require_both               TINYINT(1)    NOT NULL DEFAULT 0,
             shift_start                TIME          NOT NULL DEFAULT '09:30:00',
             shift_end                  TIME          NOT NULL DEFAULT '18:30:00',
-            grace_minutes              INT           NOT NULL DEFAULT 15,
+            grace_minutes              INT           NOT NULL DEFAULT 10,
             outside_tolerance_minutes  INT           NOT NULL DEFAULT 10,
             heartbeat_seconds          INT           NOT NULL DEFAULT 60,
             reverify_count             INT           NOT NULL DEFAULT 2,
@@ -403,13 +403,19 @@ const migrate = async () => {
       },
     ];
 
+    const failedAttendanceTables = [];
     for (const table of attendanceTables) {
       try {
         await pool.query(table.sql);
         console.log(`✅ ${table.name} table ready`);
       } catch (err) {
+        failedAttendanceTables.push(table.name);
         console.warn(`⚠️  ${table.name}:`, err.message);
       }
+    }
+
+    if (failedAttendanceTables.length > 0) {
+      console.warn(`\n⚠️  ${failedAttendanceTables.length} attendance table(s) failed: ${failedAttendanceTables.join(', ')}`);
     }
 
     console.log('\n🎉 All migrations completed successfully.');

@@ -32,6 +32,12 @@ Non-production CORS also allows `http://localhost:3000` and
 `http://127.0.0.1:3000`. Optional extra origins:
 `EXTRA_ALLOWED_ORIGINS=http://localhost:3001`
 
+Configuration variables:
+- `FACE_ENC_KEY`: 32-byte key as 64 hex characters for AES-256-GCM encryption of stored face templates.
+- `FACE_MATCH_THRESHOLD`: Euclidean distance threshold for 1:1 face matching (default `0.5`).
+- `FACE_REPLAY_EPSILON`: Minimum pairwise distance between multi-frame descriptors for replay detection (default `0.004`). Note: this threshold must be tuned with real camera capture data and is not a substitute for proper biometric liveness.
+- `TRUSTED_PROXY_HOPS`: Number of reverse proxy hops to trust counting from the right of `X-Forwarded-For` (default `1` for AWS ALB / Nginx).
+
 See `ATTENDANCE_API.md` (added in a later phase) for the full contract.
 
 ---
