@@ -9,6 +9,9 @@ function parseRecord(row) {
     check_in_lat: row.check_in_lat != null ? Number(row.check_in_lat) : null,
     check_in_lng: row.check_in_lng != null ? Number(row.check_in_lng) : null,
     check_in_accuracy: row.check_in_accuracy != null ? Number(row.check_in_accuracy) : null,
+    check_out_lat: row.check_out_lat != null ? Number(row.check_out_lat) : null,
+    check_out_lng: row.check_out_lng != null ? Number(row.check_out_lng) : null,
+    check_out_accuracy: row.check_out_accuracy != null ? Number(row.check_out_accuracy) : null,
   };
 }
 
@@ -16,7 +19,8 @@ const SELECT = `
   id, user_id, attendance_date, fullname, office_id,
   ${sqlUtc('check_in_at')}, ${sqlUtc('check_out_at')},
   status, worked_minutes,
-  check_in_lat, check_in_lng, check_in_accuracy, ip,
+  check_in_lat, check_in_lng, check_in_accuracy,
+  check_out_lat, check_out_lng, check_out_accuracy, ip,
   ${sqlUtc('created_at')}, ${sqlUtc('updated_at')}
 `;
 
@@ -76,13 +80,14 @@ const AttendanceRecordModel = {
     return result.insertId;
   },
 
-  async checkout(id, { checkOutAt, workedMinutes, status }) {
+  async checkout(id, { checkOutAt, workedMinutes, status, lat = null, lng = null, accuracy = null }) {
     const now = toUtcDateTime();
     await pool.query(
       `UPDATE attendance_records
-       SET check_out_at = ?, worked_minutes = ?, status = ?, updated_at = ?
+       SET check_out_at = ?, worked_minutes = ?, status = ?,
+           check_out_lat = ?, check_out_lng = ?, check_out_accuracy = ?, updated_at = ?
        WHERE id = ? AND check_out_at IS NULL`,
-      [checkOutAt, workedMinutes, status, now, id]
+      [checkOutAt, workedMinutes, status, lat, lng, accuracy, now, id]
     );
   },
 

@@ -179,11 +179,12 @@ async function loadTemplate(userId) {
   return decryptEmbedding(buf);
 }
 
-async function applyPresenceTransition({ recordId, userId, nextState, at, lat, lng, accuracy }) {
+async function applyPresenceTransition({ recordId, userId, nextState, outsideStreak, at, lat, lng, accuracy }) {
   const presence = await AttendancePresenceModel.findByRecordId(recordId);
   const utc = toUtcDateTime(at);
   let lastInsideAt = presence?.last_inside_at || null;
   let outsideSince = presence?.outside_since || null;
+  const streak = nextState === 'INSIDE' ? 0 : (outsideStreak !== undefined ? outsideStreak : (presence?.outside_streak || 1));
 
   if (nextState === 'INSIDE') {
     lastInsideAt = utc;
@@ -196,7 +197,7 @@ async function applyPresenceTransition({ recordId, userId, nextState, at, lat, l
 
   if (!presence) {
     await AttendancePresenceModel.create(null, {
-      recordId, userId, state: nextState, at: utc, lat, lng, accuracy,
+      recordId, userId, state: nextState, outsideStreak: streak, at: utc, lat, lng, accuracy,
     });
     await AttendanceIntervalModel.open(null, { recordId, state: nextState, startedAt: utc });
     return { state: nextState, lastInsideAt, outsideSince };
@@ -210,6 +211,7 @@ async function applyPresenceTransition({ recordId, userId, nextState, at, lat, l
   await AttendancePresenceModel.updateHeartbeat({
     recordId,
     state: nextState,
+    outsideStreak: streak,
     at: utc,
     lat,
     lng,
@@ -246,6 +248,7 @@ async function createCheckInRecord({ user, office, profile, lat, lng, accuracy, 
       recordId,
       userId: user.user_id,
       state: 'INSIDE',
+      outsideStreak: 0,
       at: utc,
       lat,
       lng,
