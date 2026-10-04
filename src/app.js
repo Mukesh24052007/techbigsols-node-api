@@ -17,6 +17,7 @@ const app = express();
 const allowedOrigins = [
   'https://techbigsolutions.in',
   'https://www.techbigsolutions.in',
+  'http://localhost:3000'
 ];
 
 // Security & utility middleware
