@@ -451,23 +451,373 @@ Errors use HTTP status codes and provide error details:
 
 ---
 
-## Endpoints from Later Phases (Not Yet Built)
+## Phase 4 Admin & Real-Time APIs
 
-The following endpoints will be built in **Phase 3 and Phase 4**:
+### 13. Offices CRUD
 
-- `GET /api/attendance/admin/offices` (Phase 4)
-- `POST /api/attendance/admin/offices` (Phase 4)
-- `PUT /api/attendance/admin/offices/:id` (Phase 4)
-- `DELETE /api/attendance/admin/offices/:id` (Phase 4)
-- `GET /api/attendance/admin/employees` (Phase 4)
-- `PUT /api/attendance/admin/employees/:userId/profile` (Phase 4)
-- `GET /api/attendance/admin/live` (Phase 4)
-- `GET /api/attendance/admin/stream` (Phase 4 - Server-Sent Events)
-- `GET /api/attendance/admin/employees/:userId/timeline` (Phase 4)
-- `GET /api/attendance/admin/attempts` (Phase 4)
-- `GET /api/attendance/admin/report` (Phase 4 - JSON/CSV export)
-- `GET /api/attendance/admin/regularizations` (Phase 4)
-- `POST /api/attendance/admin/regularizations/:id/approve` (Phase 4)
-- `POST /api/attendance/admin/regularizations/:id/reject` (Phase 4)
-- `PATCH /api/attendance/admin/records/:id` (Phase 4 - Manual edit with audit log)
-- Background sweeper service: `src/services/attendanceSweeper.js` (Phase 3)
+#### POST `/api/attendance/admin/offices`
+- **Auth**: Admin (`protect`)
+- **Request Body**:
+  ```json
+  {
+    "name": "Bangalore HQ",
+    "lat": 12.9715987,
+    "lng": 77.5945627,
+    "radius_m": 200,
+    "accuracy_max_m": 50,
+    "shift_start": "09:30:00",
+    "shift_end": "18:30:00",
+    "grace_minutes": 10,
+    "outside_tolerance_minutes": 10,
+    "short_outing_allowance_minutes": 30,
+    "heartbeat_seconds": 60,
+    "reverify_count": 2,
+    "ip_allowlist": ["203.0.113.0/24"],
+    "require_both": 0
+  }
+  ```
+- **Validation Constraints**:
+  - `name`: string, 1..150 characters.
+  - `lat`: number, -90..90.
+  - `lng`: number, -180..180.
+  - `radius_m`: integer, 20..2000.
+  - `accuracy_max_m`: integer, 10..200.
+  - `grace_minutes`: integer, 0..120.
+  - `outside_tolerance_minutes`: integer, 1..60.
+  - `short_outing_allowance_minutes`: integer, 0..180.
+  - `heartbeat_seconds`: integer, 15..300.
+  - `reverify_count`: integer, 0..10.
+  - `ip_allowlist`: array of valid IPv4/IPv6 strings or CIDRs, or null.
+- **Success Response (201)**:
+  ```json
+  {
+    "success": true,
+    "message": "Office created successfully",
+    "data": {
+      "office": { "id": 1, "name": "Bangalore HQ", ... }
+    }
+  }
+  ```
+
+#### GET `/api/attendance/admin/offices`
+- **Auth**: Admin (`protect`)
+- **Success Response (200)**:
+  ```json
+  {
+    "success": true,
+    "data": {
+      "offices": [ ... ]
+    }
+  }
+  ```
+
+#### GET `/api/attendance/admin/offices/:id`
+- **Auth**: Admin (`protect`)
+- **Success Response (200)**:
+  ```json
+  {
+    "success": true,
+    "data": {
+      "office": { "id": 1, "name": "Bangalore HQ", ... }
+    }
+  }
+  ```
+
+#### PUT `/api/attendance/admin/offices/:id`
+- **Auth**: Admin (`protect`)
+- **Request Body**: Partial office fields. Same range validation applies.
+- **Success Response (200)**:
+  ```json
+  {
+    "success": true,
+    "message": "Office updated successfully",
+    "data": {
+      "office": { ... }
+    }
+  }
+  ```
+
+#### DELETE `/api/attendance/admin/offices/:id`
+- **Auth**: Admin (`protect`)
+- **Reference Check**: Checks whether any employee profile (`attendance_profiles.office_id`) or attendance record (`attendance_records.office_id`) references this office.
+  - If references exist: returns `409 Conflict` (`Cannot delete office: referenced by employee profiles or attendance records.`).
+  - If unreferenced: deletes office row, records audit log, and returns `200 OK`.
+
+---
+
+### 14. Employees & Profiles
+
+#### GET `/api/attendance/admin/employees`
+- **Auth**: Admin (`protect`)
+- **Response**: List of all active employees with the `Attendance` module, including profile, shift, office, enrollment status, and consent timestamp. Sensitive credentials, face embeddings, and password hashes are strictly excluded.
+- **Success Response (200)**:
+  ```json
+  {
+    "success": true,
+    "data": {
+      "employees": [
+        {
+          "userId": "tb001",
+          "fullname": "Nandha Kumar",
+          "email": "nandha@techbigsols.com",
+          "department": "Engineering",
+          "designation": "Software Engineer",
+          "office": { "id": 1, "name": "Bangalore HQ" },
+          "faceEnrolled": true,
+          "consentGiven": true,
+          "consentAt": "2026-10-01T04:00:00.000Z",
+          "faceEnrolledAt": "2026-10-01T04:15:00.000Z"
+        }
+      ]
+    }
+  }
+  ```
+
+#### PUT `/api/attendance/admin/employees/:userId/profile`
+- **Auth**: Admin (`protect`)
+- **Request Body**:
+  ```json
+  {
+    "officeId": 1,
+    "shiftStart": "09:30:00",
+    "shiftEnd": "18:30:00",
+    "department": "Platform Engineering",
+    "designation": "Senior Developer"
+  }
+  ```
+- **Success Response (200)**:
+  ```json
+  {
+    "success": true,
+    "message": "Profile updated successfully",
+    "data": { "profile": { ... } }
+  }
+  ```
+
+#### GET `/api/attendance/admin/employees/:userId/timeline?date=YYYY-MM-DD`
+- **Auth**: Admin (`protect`)
+- **Query Params**: `date` (defaults to today in IST).
+- **Response**: Comprehensive day timeline containing attendance record, all interval segments (`INSIDE`, `OUTSIDE`, `UNKNOWN`), verification attempts, live presence state, and last known coordinate point.
+
+---
+
+### 15. Live Presence Snapshot & Real-Time Stream
+
+#### GET `/api/attendance/admin/live`
+- **Auth**: Admin (`protect`)
+- **Performance Guarantee**: Strictly 1–2 SQL queries total (zero N+1) regardless of employee count:
+  - Query 1: Single SQL joining active employees, profiles, offices, today's records, presence, and approved leaves.
+  - Query 2: Single SQL fetching intervals for open records (`WHERE record_id IN (...)`) to feed `computeWorkedMinutes`.
+- **Success Response (200)**:
+  ```json
+  {
+    "success": true,
+    "data": {
+      "date": "2026-10-04",
+      "counts": {
+        "present": 25,
+        "late": 3,
+        "inside": 18,
+        "outside": 4,
+        "no_signal": 2,
+        "absent": 5,
+        "on_leave": 2
+      },
+      "rows": [
+        {
+          "employeeId": "tb001",
+          "name": "Nandha Kumar",
+          "department": "Engineering",
+          "checkInTime": "2026-10-04T04:02:15.000Z",
+          "status": "PRESENT",
+          "presenceState": "INSIDE",
+          "reason": null,
+          "since": "2026-10-04T04:02:15.000Z",
+          "workedMinutes": 312,
+          "reverifyPending": false
+        }
+      ]
+    }
+  }
+  ```
+
+#### GET `/api/attendance/admin/stream` (Server-Sent Events)
+- **Auth**: Admin (`protect`)
+- **Content-Type**: `text/event-stream`
+- **Features**:
+  - Connection limit: Capped at **5 concurrent streams** per admin account. 6th concurrent stream receives `429 Too Many Requests`.
+  - Token expiration: Stream automatically disconnects when the admin JWT expires.
+  - Heartbeat comment: Emits `: ping\n\n` comment ping every 25 seconds to keep proxies/tunnels alive.
+  - Domain events: Subscribes to `attendanceBus` and emits SSE messages for:
+    - `checkin`
+    - `reverify`
+    - `left_premises` (reasons: `'left'`, `'no_signal'`, `'weak_gps'`)
+    - `returned`
+    - `auto_checkout`
+    - `violation`
+  - Event payload shape:
+    ```
+    event: checkin
+    data: {"employeeId":"tb001","name":"Nandha Kumar","type":"checkin","time":"2026-10-04T04:02:15.000Z"}
+    ```
+
+---
+
+### 16. Monthly Aggregated Report
+
+#### GET `/api/attendance/admin/report?month=YYYY-MM&format=json|csv`
+- **Auth**: Admin (`protect`)
+- **Query Params**:
+  - `month`: required, format `YYYY-MM`.
+  - `format`: optional, `'json'` (default) or `'csv'`.
+- **Spreadsheet Formula Injection Neutralization**:
+  When `format=csv`, all cell values starting with `= , + , - , @ , \t , \r` are automatically prefixed with a single quote `'` in accordance with OWASP CSV Injection guidelines.
+- **CSV Response Headers**:
+  - `Content-Type: text/csv`
+  - `Content-Disposition: attachment; filename="attendance-report-YYYY-MM.csv"`
+- **Fields in Report**:
+  - `user_id` / Employee ID
+  - `fullname` / Name
+  - `department` / Department
+  - `days_present`
+  - `days_late`
+  - `days_leave`
+  - `days_absent`
+  - `total_worked_minutes`
+  - `total_deducted_minutes`
+
+---
+
+### 17. Biometric & Geofence Verification Attempts
+
+#### GET `/api/attendance/admin/attempts`
+- **Auth**: Admin (`protect`)
+- **Query Params**:
+  - `user`: filter by user ID.
+  - `date`: filter by `YYYY-MM-DD`.
+  - `success`: filter by `true` / `false`.
+  - `limit`: page size (default 50, capped at 100).
+  - `offset`: pagination offset (default 0).
+- **Success Response (200)**:
+  ```json
+  {
+    "success": true,
+    "data": {
+      "total": 142,
+      "page": 1,
+      "limit": 50,
+      "rows": [
+        {
+          "id": 105,
+          "userId": "tb001",
+          "kind": "checkin",
+          "success": true,
+          "distanceScore": 0.2314,
+          "accuracy": 18.5,
+          "ip": "203.0.113.10",
+          "reason": "GPS + Face verified",
+          "createdAt": "2026-10-04T04:02:15.000Z",
+          "fullname": "Nandha Kumar",
+          "department": "Engineering"
+        }
+      ]
+    }
+  }
+  ```
+
+---
+
+### 18. Regularization Management
+
+#### GET `/api/attendance/admin/regularizations`
+- **Auth**: Admin (`protect`)
+- **Query Params**: `status` (`'PENDING' | 'APPROVED' | 'REJECTED'`), `limit`, `offset`.
+
+#### POST `/api/attendance/admin/regularizations/:id/approve`
+- **Auth**: Admin (`protect`)
+- **Request Body**:
+  ```json
+  {
+    "checkInTime": "09:30",
+    "checkOutTime": "18:30",
+    "status": "PRESENT"
+  }
+  ```
+- **Rules**:
+  - Only requests in `PENDING` status can be approved (returns `409 Conflict` otherwise).
+  - `checkOutTime` must be strictly after `checkInTime`.
+  - Automatically computes worked minutes and upserts the attendance record for the date.
+  - Updates regularization status to `APPROVED`, records admin ID and review timestamp.
+  - Writes audit log entry.
+
+#### POST `/api/attendance/admin/regularizations/:id/reject`
+- **Auth**: Admin (`protect`)
+- **Rules**:
+  - Only requests in `PENDING` status can be rejected (returns `409 Conflict` otherwise).
+  - Updates status to `REJECTED`, records admin ID, and writes audit log entry.
+
+---
+
+### 19. Manual Record Adjustments
+
+#### PATCH `/api/attendance/admin/records/:id`
+- **Auth**: Admin (`protect`)
+- **Request Body**:
+  ```json
+  {
+    "check_in_at": "2026-10-04 04:00:00",
+    "check_out_at": "2026-10-04 13:00:00",
+    "status": "PRESENT",
+    "reason": "Corrected punch time due to network disruption during swipe"
+  }
+  ```
+- **Rules & Guardrails**:
+  - `reason` is **mandatory** and must be at least **10 characters** long (`400 Bad Request` if shorter).
+  - Only `check_in_at`, `check_out_at`, and `status` can be modified.
+  - Both `check_in_at` and `check_out_at` must fall on the exact same IST date as `attendance_date`.
+  - Automatically recalculates `worked_minutes` as the span between check-in and check-out.
+  - Writes audit log entry recording before and after snapshots with the mandatory reason.
+
+---
+
+### 20. Leaves Management
+
+#### POST `/api/attendance/admin/leaves`
+- **Auth**: Admin (`protect`)
+- **Request Body**:
+  ```json
+  {
+    "userId": "tb001",
+    "fromDate": "2026-10-12",
+    "toDate": "2026-10-14",
+    "reason": "Annual vacation"
+  }
+  ```
+- **Rules**:
+  - Validates `fromDate <= toDate`.
+  - Checks for overlapping approved leaves for the employee; returns `409 Conflict` if any day overlaps.
+  - Inserts individual daily records in `attendance_leaves` with status `APPROVED`.
+  - Writes audit log entry.
+
+#### GET `/api/attendance/admin/leaves`
+- **Auth**: Admin (`protect`)
+- **Query Params**: `user`, `month` (`YYYY-MM`), `status`, `limit`, `offset`.
+
+#### DELETE `/api/attendance/admin/leaves/:id`
+- **Auth**: Admin (`protect`)
+- **Behavior**: Marks the leave as `REJECTED` (cancelled), records the cancelling admin ID, and writes an audit log entry.
+
+---
+
+### 21. Developer Seeding Script
+
+A helper script is provided to seed or update a local developer environment with an office and employee profile:
+
+```bash
+node scripts/seed-attendance-dev.js --lat=12.9716 --lng=77.5946 [--radius=200] --user=tb001
+```
+
+- **Guards**: Refuses execution if `DB_HOST` is not localhost/127.0.0.1 or if `NODE_ENV === 'production'`.
+- **Idempotency**: Upserts `"Dev Office"` (accuracy 100m, radius 200m) and associates the given user with default shift `09:30:00` - `18:30:00`.
+- **Output**: Prints summary without logging credentials or secrets.
+

@@ -114,6 +114,45 @@ const AttendanceRecordModel = {
     );
     return rows.map(parseRecord);
   },
+
+  async updateRecordAdmin(id, { checkInAt, checkOutAt, status, workedMinutes }) {
+    const setClauses = ['updated_at = UTC_TIMESTAMP()'];
+    const params = [];
+
+    if (checkInAt !== undefined) { setClauses.push('check_in_at = ?'); params.push(checkInAt); }
+    if (checkOutAt !== undefined) { setClauses.push('check_out_at = ?'); params.push(checkOutAt); }
+    if (status !== undefined) { setClauses.push('status = ?'); params.push(status); }
+    if (workedMinutes !== undefined) { setClauses.push('worked_minutes = ?'); params.push(workedMinutes); }
+
+    params.push(id);
+    const [result] = await pool.query(
+      `UPDATE attendance_records SET ${setClauses.join(', ')} WHERE id = ?`,
+      params
+    );
+    return result.affectedRows > 0;
+  },
+
+  async upsertForRegularization({ userId, attendanceDate, fullname, officeId, checkInAt, checkOutAt, status, workedMinutes }) {
+    const existing = await AttendanceRecordModel.findByUserDate(userId, attendanceDate);
+    const now = toUtcDateTime();
+    if (existing) {
+      await pool.query(
+        `UPDATE attendance_records
+         SET check_in_at = ?, check_out_at = ?, status = ?, worked_minutes = ?, updated_at = ?
+         WHERE id = ?`,
+        [checkInAt, checkOutAt, status, workedMinutes, now, existing.id]
+      );
+      return { id: existing.id, action: 'updated', record: await AttendanceRecordModel.findById(existing.id) };
+    } else {
+      const [res] = await pool.query(
+        `INSERT INTO attendance_records
+          (user_id, attendance_date, fullname, office_id, check_in_at, check_out_at, status, worked_minutes, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [userId, attendanceDate, fullname, officeId, checkInAt, checkOutAt, status, workedMinutes, now, now]
+      );
+      return { id: res.insertId, action: 'created', record: await AttendanceRecordModel.findById(res.insertId) };
+    }
+  },
 };
 
 module.exports = AttendanceRecordModel;

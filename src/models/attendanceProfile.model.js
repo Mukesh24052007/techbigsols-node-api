@@ -68,6 +68,60 @@ const AttendanceProfileModel = {
     );
     return result.affectedRows > 0;
   },
+
+  async upsertProfile(userId, { officeId, shiftStart, shiftEnd, department, designation }) {
+    const now = toUtcDateTime();
+    await pool.query(
+      `INSERT INTO attendance_profiles
+        (user_id, office_id, shift_start, shift_end, department, designation, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         office_id = COALESCE(VALUES(office_id), office_id),
+         shift_start = COALESCE(VALUES(shift_start), shift_start),
+         shift_end = COALESCE(VALUES(shift_end), shift_end),
+         department = COALESCE(VALUES(department), department),
+         designation = COALESCE(VALUES(designation), designation),
+         updated_at = VALUES(updated_at)`,
+      [userId, officeId || null, shiftStart || null, shiftEnd || null, department || null, designation || null, now, now]
+    );
+    return await AttendanceProfileModel.findByUserId(userId);
+  },
+
+  async listAllEmployees() {
+    const [rows] = await pool.query(
+      `SELECT
+         u.user_id AS userId,
+         u.fullname,
+         u.email,
+         p.department,
+         p.designation,
+         p.office_id,
+         o.name AS office_name,
+         CASE WHEN p.face_template IS NOT NULL AND LENGTH(p.face_template) > 0 THEN 1 ELSE 0 END AS faceEnrolled,
+         CASE WHEN p.consent_at IS NOT NULL THEN 1 ELSE 0 END AS consentGiven,
+         ${sqlUtc('p.consent_at', 'consentAt')},
+         ${sqlUtc('p.face_enrolled_at', 'faceEnrolledAt')}
+       FROM site_users u
+       LEFT JOIN attendance_profiles p ON p.user_id = u.user_id COLLATE utf8mb4_unicode_ci
+       LEFT JOIN attendance_offices o ON o.id = p.office_id
+       WHERE u.is_active = 1
+         AND JSON_CONTAINS(u.module_access, '"Attendance"')
+       ORDER BY u.fullname ASC`
+    );
+
+    return rows.map((r) => ({
+      userId: r.userId,
+      fullname: r.fullname,
+      email: r.email,
+      department: r.department || null,
+      designation: r.designation || null,
+      office: r.office_id ? { id: r.office_id, name: r.office_name } : null,
+      faceEnrolled: Boolean(r.faceEnrolled),
+      consentGiven: Boolean(r.consentGiven),
+      consentAt: r.consentAt || null,
+      faceEnrolledAt: r.faceEnrolledAt || null,
+    }));
+  },
 };
 
 module.exports = AttendanceProfileModel;

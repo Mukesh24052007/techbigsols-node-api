@@ -42,6 +42,10 @@ class AttendanceBus {
     this._emitter.emit(`attendance:${type}`, sanitized);
   }
 
+  emitAttendanceEvent(type, payload) {
+    return this.emit(type, payload);
+  }
+
   /**
    * Subscribes to attendance events.
    * @param {Function} fn - Listener callback receiving sanitized payload

@@ -1,4 +1,5 @@
 const crypto = require('crypto');
+const jwt = require('jsonwebtoken');
 const { pool } = require('../config/db');
 const {
   httpError,
@@ -8,6 +9,7 @@ const {
   clientIp,
   parseMonth,
   parseIsoDate,
+  validateOfficeInput,
 } = require('../utils/attendanceValidate');
 const { haversineMetres } = require('../utils/geo');
 const { encryptEmbedding } = require('../utils/crypto');
@@ -17,8 +19,9 @@ const {
   minPairwiseDistance,
   replayEpsilon,
 } = require('../utils/faceMath');
-const { toUtcDateTime, istCalendarDate } = require('../utils/time');
+const { toUtcDateTime, fromUtcDateTime, istCalendarDate, istDateTimeToUtc, sqlUtc } = require('../utils/time');
 const { computeWorkedMinutes } = require('../utils/workedMinutes');
+const { toCsv } = require('../utils/csv');
 const attendanceBus = require('../services/attendanceBus');
 
 const {
@@ -46,8 +49,16 @@ const AttendanceProfileModel = require('../models/attendanceProfile.model');
 const AttendanceOfficeModel = require('../models/attendanceOffice.model');
 const AttendanceRegularizationModel = require('../models/attendanceRegularization.model');
 const AttendanceAuditLogModel = require('../models/attendanceAuditLog.model');
+const AttendanceLeaveModel = require('../models/attendanceLeave.model');
+const AttendanceAttemptModel = require('../models/attendanceAttempt.model');
+const SiteUserModel = require('../models/siteUser.model');
+
+// Map of adminId -> number of active SSE streams
+const activeAdminStreams = new Map();
 
 const AttendanceController = {
+  // Injectable ping interval for testing
+  ssePingIntervalMs: 25000,
   /**
    * GET /api/attendance/ping
    */
@@ -772,6 +783,908 @@ const AttendanceController = {
         success: true,
         message: 'Face template deleted successfully',
         data: { userId },
+      });
+    } catch (err) {
+      next(err);
+    }
+  },
+
+  // ── Offices CRUD ──────────────────────────────────────────────────────────
+
+  /**
+   * POST /api/attendance/admin/offices
+   */
+  async adminCreateOffice(req, res, next) {
+    try {
+      const data = validateOfficeInput(req.body, false);
+      const id = await AttendanceOfficeModel.create(data);
+      const office = await AttendanceOfficeModel.findById(id);
+
+      await AttendanceAuditLogModel.log({
+        actorAdminId: req.admin.id,
+        action: 'office_create',
+        entityType: 'office',
+        entityId: id,
+        afterJson: office,
+      });
+
+      return res.status(201).json({
+        success: true,
+        message: 'Office created successfully',
+        data: { office },
+      });
+    } catch (err) {
+      next(err);
+    }
+  },
+
+  /**
+   * GET /api/attendance/admin/offices
+   */
+  async adminGetOffices(req, res, next) {
+    try {
+      const offices = await AttendanceOfficeModel.findAll();
+      return res.status(200).json({
+        success: true,
+        data: { offices },
+      });
+    } catch (err) {
+      next(err);
+    }
+  },
+
+  /**
+   * GET /api/attendance/admin/offices/:id
+   */
+  async adminGetOfficeById(req, res, next) {
+    try {
+      const office = await AttendanceOfficeModel.findById(req.params.id);
+      if (!office) throw httpError(404, 'Office not found.');
+      return res.status(200).json({
+        success: true,
+        data: { office },
+      });
+    } catch (err) {
+      next(err);
+    }
+  },
+
+  /**
+   * PUT /api/attendance/admin/offices/:id
+   */
+  async adminUpdateOffice(req, res, next) {
+    try {
+      const id = req.params.id;
+      const existing = await AttendanceOfficeModel.findById(id);
+      if (!existing) throw httpError(404, 'Office not found.');
+
+      const data = validateOfficeInput(req.body, true);
+      await AttendanceOfficeModel.update(id, data);
+      const updated = await AttendanceOfficeModel.findById(id);
+
+      await AttendanceAuditLogModel.log({
+        actorAdminId: req.admin.id,
+        action: 'office_update',
+        entityType: 'office',
+        entityId: id,
+        beforeJson: existing,
+        afterJson: updated,
+      });
+
+      return res.status(200).json({
+        success: true,
+        message: 'Office updated successfully',
+        data: { office: updated },
+      });
+    } catch (err) {
+      next(err);
+    }
+  },
+
+  /**
+   * DELETE /api/attendance/admin/offices/:id
+   */
+  async adminDeleteOffice(req, res, next) {
+    try {
+      const id = req.params.id;
+      const existing = await AttendanceOfficeModel.findById(id);
+      if (!existing) throw httpError(404, 'Office not found.');
+
+      const refs = await AttendanceOfficeModel.countReferences(id);
+      if (refs.total > 0) {
+        throw httpError(409, 'Cannot delete office: referenced by employee profiles or attendance records.');
+      }
+
+      await AttendanceOfficeModel.delete(id);
+      await AttendanceAuditLogModel.log({
+        actorAdminId: req.admin.id,
+        action: 'office_delete',
+        entityType: 'office',
+        entityId: id,
+        beforeJson: existing,
+      });
+
+      return res.status(200).json({
+        success: true,
+        message: 'Office deleted successfully',
+      });
+    } catch (err) {
+      next(err);
+    }
+  },
+
+  // ── Employees & Profile ───────────────────────────────────────────────────
+
+  /**
+   * GET /api/attendance/admin/employees
+   */
+  async adminGetEmployees(req, res, next) {
+    try {
+      const employees = await AttendanceProfileModel.listAllEmployees();
+      return res.status(200).json({
+        success: true,
+        data: { employees },
+      });
+    } catch (err) {
+      next(err);
+    }
+  },
+
+  /**
+   * PUT /api/attendance/admin/employees/:userId/profile
+   */
+  async adminUpdateEmployeeProfile(req, res, next) {
+    try {
+      const userId = req.params.userId;
+      const siteUser = await SiteUserModel.findById(userId);
+      if (!siteUser) throw httpError(404, 'Site user not found.');
+
+      const existing = await AttendanceProfileModel.findByUserId(userId);
+      const { officeId, shiftStart, shiftEnd, department, designation } = req.body || {};
+
+      if (officeId) {
+        const office = await AttendanceOfficeModel.findById(officeId);
+        if (!office) throw httpError(400, 'Office does not exist.');
+      }
+
+      const updated = await AttendanceProfileModel.upsertProfile(userId, {
+        officeId,
+        shiftStart,
+        shiftEnd,
+        department,
+        designation,
+      });
+
+      await AttendanceAuditLogModel.log({
+        actorAdminId: req.admin.id,
+        action: 'profile_update',
+        entityType: 'profile',
+        entityId: userId,
+        beforeJson: existing,
+        afterJson: updated,
+      });
+
+      return res.status(200).json({
+        success: true,
+        message: 'Profile updated successfully',
+        data: { profile: updated },
+      });
+    } catch (err) {
+      next(err);
+    }
+  },
+
+  /**
+   * GET /api/attendance/admin/employees/:userId/timeline?date=YYYY-MM-DD
+   */
+  async adminGetTimeline(req, res, next) {
+    try {
+      const userId = req.params.userId;
+      const date = req.query.date ? parseIsoDate(req.query.date, 'date') : istCalendarDate(new Date());
+
+      const siteUser = await SiteUserModel.findById(userId);
+      if (!siteUser) throw httpError(404, 'Site user not found.');
+
+      const record = await AttendanceRecordModel.findByUserDate(userId, date);
+      if (!record) {
+        return res.status(200).json({
+          success: true,
+          data: {
+            date,
+            record: null,
+            intervals: [],
+            attempts: [],
+            presenceState: null,
+            lastKnownPoint: null,
+            workedMinutes: 0,
+          },
+        });
+      }
+
+      const intervals = await AttendanceIntervalModel.findAllByRecord(record.id);
+      const presence = await AttendancePresenceModel.findByRecordId(record.id);
+      const attemptsResult = await AttendanceAttemptModel.findAll({ userId, date, limit: 100 });
+
+      const isOpen = record.check_in_at != null && record.check_out_at == null;
+      const lastKnownPoint =
+        isOpen && presence && presence.last_lat != null && presence.last_lng != null
+          ? {
+              lat: presence.last_lat,
+              lng: presence.last_lng,
+              accuracy: presence.last_accuracy,
+              at: presence.last_heartbeat_at,
+            }
+          : null;
+
+      const profile = await AttendanceProfileModel.findByUserId(userId);
+      const office = profile?.office_id ? await AttendanceOfficeModel.findById(profile.office_id) : null;
+
+      const workedMinutes = isOpen
+        ? computeWorkedMinutes({
+            checkInAt: record.check_in_at,
+            closeTime: new Date(),
+            intervals,
+            toleranceMinutes: office?.outside_tolerance_minutes || 10,
+            allowanceMinutes: office?.short_outing_allowance_minutes || 30,
+          })
+        : record.worked_minutes;
+
+      return res.status(200).json({
+        success: true,
+        data: {
+          date,
+          record,
+          intervals,
+          attempts: attemptsResult.rows,
+          presenceState: presence?.state || (record.check_out_at ? 'CHECKED_OUT' : null),
+          lastKnownPoint,
+          workedMinutes,
+        },
+      });
+    } catch (err) {
+      next(err);
+    }
+  },
+
+  // ── Live Snapshot & SSE Stream ────────────────────────────────────────────
+
+  /**
+   * GET /api/attendance/admin/live
+   * Exactly 1-2 queries (no N+1): Query 1 joins users, profiles, records, presence, leaves;
+   * Query 2 fetches open intervals for worked minutes computation.
+   */
+  async adminGetLive(req, res, next) {
+    try {
+      const today = istCalendarDate(new Date());
+
+      // Query 1: Active Attendance employees + today's record + presence + approved leave
+      const [rows] = await pool.query(
+        `SELECT
+           u.user_id AS employee_id,
+           u.fullname,
+           prof.department,
+           r.id AS record_id,
+           ${sqlUtc('r.check_in_at', 'check_in_at')},
+           ${sqlUtc('r.check_out_at', 'check_out_at')},
+           r.status AS record_status,
+           r.worked_minutes AS stored_worked_minutes,
+           p.state AS presence_state,
+           p.reason AS presence_reason,
+           ${sqlUtc('p.last_heartbeat_at', 'last_heartbeat_at')},
+           ${sqlUtc('p.outside_since', 'outside_since')},
+           ${sqlUtc('p.last_inside_at', 'last_inside_at')},
+           p.left_alerted_at,
+           o.outside_tolerance_minutes,
+           o.short_outing_allowance_minutes,
+           l.id AS leave_id,
+           l.reason AS leave_reason,
+           (
+             SELECT id FROM attendance_reverify_tasks
+             WHERE record_id = r.id AND status = 'PENDING'
+             LIMIT 1
+           ) AS pending_reverify_id
+         FROM site_users u
+         LEFT JOIN attendance_profiles prof ON prof.user_id = u.user_id COLLATE utf8mb4_unicode_ci
+         LEFT JOIN attendance_offices o ON o.id = prof.office_id
+         LEFT JOIN attendance_records r ON r.user_id = u.user_id COLLATE utf8mb4_unicode_ci AND r.attendance_date = ?
+         LEFT JOIN attendance_presence p ON p.record_id = r.id
+         LEFT JOIN attendance_leaves l ON l.user_id = u.user_id COLLATE utf8mb4_unicode_ci AND l.leave_date = ? AND l.status = 'APPROVED'
+         WHERE u.is_active = 1
+           AND JSON_CONTAINS(u.module_access, '"Attendance"')
+         ORDER BY u.fullname ASC`,
+        [today, today]
+      );
+
+      // Collect open record IDs for Query 2
+      const openRecordIds = rows
+        .filter((r) => r.record_id && r.check_in_at && !r.check_out_at)
+        .map((r) => r.record_id);
+
+      const intervalsByRecord = {};
+      if (openRecordIds.length > 0) {
+        // Query 2: All intervals for open records
+        const [intervals] = await pool.query(
+          `SELECT record_id, state, ${sqlUtc('started_at', 'started_at')}, ${sqlUtc('ended_at', 'ended_at')}
+           FROM attendance_intervals
+           WHERE record_id IN (?)
+           ORDER BY started_at ASC`,
+          [openRecordIds]
+        );
+        for (const intv of intervals) {
+          if (!intervalsByRecord[intv.record_id]) intervalsByRecord[intv.record_id] = [];
+          intervalsByRecord[intv.record_id].push(intv);
+        }
+      }
+
+      const now = new Date();
+      let presentCount = 0;
+      let lateCount = 0;
+      let insideCount = 0;
+      let outsideCount = 0;
+      let noSignalCount = 0;
+      let absentCount = 0;
+      let onLeaveCount = 0;
+
+      const employeeRows = rows.map((r) => {
+        const isOpen = Boolean(r.record_id && r.check_in_at && !r.check_out_at);
+        const hasRecord = Boolean(r.record_id);
+        const isOnLeave = Boolean(r.leave_id);
+
+        if (hasRecord) {
+          presentCount += 1;
+          if (r.record_status === 'LATE') lateCount += 1;
+        }
+
+        if (isOpen) {
+          if (r.presence_state === 'INSIDE') insideCount += 1;
+          else if (r.presence_state === 'OUTSIDE') outsideCount += 1;
+          else if (r.presence_state === 'UNKNOWN') noSignalCount += 1;
+        } else if (isOnLeave) {
+          onLeaveCount += 1;
+        } else if (!hasRecord) {
+          absentCount += 1;
+        }
+
+        let workedMinutes = 0;
+        if (isOpen) {
+          workedMinutes = computeWorkedMinutes({
+            checkInAt: r.check_in_at,
+            closeTime: now,
+            intervals: intervalsByRecord[r.record_id] || [],
+            toleranceMinutes: r.outside_tolerance_minutes || 10,
+            allowanceMinutes: r.short_outing_allowance_minutes || 30,
+          });
+        } else if (hasRecord) {
+          workedMinutes = Number(r.stored_worked_minutes) || 0;
+        }
+
+        let since = null;
+        if (r.presence_state === 'OUTSIDE') since = r.outside_since || r.last_heartbeat_at;
+        else if (r.presence_state === 'UNKNOWN') since = r.last_inside_at || r.last_heartbeat_at;
+        else if (r.presence_state === 'INSIDE') since = r.last_inside_at || r.check_in_at;
+        else if (r.check_out_at) since = r.check_out_at;
+
+        let status = 'ABSENT';
+        if (hasRecord) status = r.record_status;
+        else if (isOnLeave) status = 'LEAVE';
+
+        let presenceState = 'ABSENT';
+        if (isOpen) presenceState = r.presence_state;
+        else if (hasRecord && r.check_out_at) presenceState = 'CHECKED_OUT';
+        else if (isOnLeave) presenceState = 'LEAVE';
+
+        return {
+          employeeId: r.employee_id,
+          name: r.fullname,
+          department: r.department,
+          checkInTime: r.check_in_at || null,
+          status,
+          presenceState,
+          reason: r.presence_reason || (isOnLeave ? r.leave_reason : null),
+          since: since || null,
+          workedMinutes,
+          reverifyPending: Boolean(r.pending_reverify_id),
+        };
+      });
+
+      return res.status(200).json({
+        success: true,
+        data: {
+          date: today,
+          counts: {
+            present: presentCount,
+            late: lateCount,
+            inside: insideCount,
+            outside: outsideCount,
+            no_signal: noSignalCount,
+            absent: absentCount,
+            on_leave: onLeaveCount,
+          },
+          rows: employeeRows,
+        },
+      });
+    } catch (err) {
+      next(err);
+    }
+  },
+
+  /**
+   * GET /api/attendance/admin/stream (SSE)
+   */
+  async adminGetStream(req, res, next) {
+    try {
+      const adminId = req.admin.id;
+      const currentActive = activeAdminStreams.get(adminId) || 0;
+      if (currentActive >= 5) {
+        return res.status(429).json({
+          success: false,
+          message: 'Too many concurrent stream connections (max 5 per admin).',
+        });
+      }
+      activeAdminStreams.set(adminId, currentActive + 1);
+
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+      res.setHeader('X-Accel-Buffering', 'no');
+      res.flushHeaders();
+
+      // Send initial comment
+      res.write(': connected\n\n');
+
+      // Schedule stream closure on JWT expiration
+      const authHeader = req.headers.authorization;
+      const token = authHeader?.split(' ')[1];
+      const decoded = jwt.decode(token);
+      let expiryTimer = null;
+      if (decoded?.exp) {
+        const msUntilExpiry = decoded.exp * 1000 - Date.now();
+        if (msUntilExpiry <= 0) {
+          activeAdminStreams.set(adminId, Math.max(0, (activeAdminStreams.get(adminId) || 1) - 1));
+          return res.status(401).end();
+        }
+        expiryTimer = setTimeout(() => {
+          res.end();
+        }, msUntilExpiry);
+      }
+
+      // Comment ping every 25 seconds (injectable for tests)
+      const pingMs = AttendanceController.ssePingIntervalMs || 25000;
+      const pingTimer = setInterval(() => {
+        res.write(': ping\n\n');
+      }, pingMs);
+
+      // Subscribe to attendanceBus
+      const unsubscribe = attendanceBus.subscribe((evt) => {
+        if (['checkin', 'reverify', 'left_premises', 'returned', 'auto_checkout', 'violation'].includes(evt.type)) {
+          const payload = {
+            employeeId: evt.employeeId,
+            name: evt.name,
+            type: evt.type,
+            time: evt.time instanceof Date ? evt.time.toISOString() : evt.time || new Date().toISOString(),
+            reason: evt.reason || null,
+          };
+          res.write(`event: ${evt.type}\ndata: ${JSON.stringify(payload)}\n\n`);
+        }
+      });
+
+      req.on('close', () => {
+        unsubscribe();
+        clearInterval(pingTimer);
+        if (expiryTimer) clearTimeout(expiryTimer);
+        activeAdminStreams.set(adminId, Math.max(0, (activeAdminStreams.get(adminId) || 1) - 1));
+      });
+    } catch (err) {
+      next(err);
+    }
+  },
+
+  // ── Reports & Attempts ───────────────────────────────────────────────────
+
+  /**
+   * GET /api/attendance/admin/report?month=YYYY-MM&format=json|csv
+   */
+  async adminGetReport(req, res, next) {
+    try {
+      const monthStr = req.query.month;
+      if (!monthStr || !/^\d{4}-\d{2}$/.test(String(monthStr))) {
+        throw httpError(400, 'month must be YYYY-MM.');
+      }
+      const format = (req.query.format || 'json').toLowerCase();
+
+      // Aggregate in SQL (no per-employee loop)
+      const [rows] = await pool.query(
+        `SELECT
+           u.user_id,
+           u.fullname,
+           prof.department,
+           COUNT(DISTINCT r.attendance_date) AS days_present,
+           SUM(CASE WHEN r.status = 'LATE' THEN 1 ELSE 0 END) AS days_late,
+           SUM(COALESCE(r.worked_minutes, 0)) AS total_worked_minutes,
+           (
+             SELECT COUNT(DISTINCT l.leave_date)
+             FROM attendance_leaves l
+             WHERE l.user_id = u.user_id COLLATE utf8mb4_unicode_ci
+               AND DATE_FORMAT(l.leave_date, '%Y-%m') = ?
+               AND l.status = 'APPROVED'
+           ) AS days_leave
+         FROM site_users u
+         LEFT JOIN attendance_profiles prof ON prof.user_id = u.user_id COLLATE utf8mb4_unicode_ci
+         LEFT JOIN attendance_records r
+           ON r.user_id = u.user_id COLLATE utf8mb4_unicode_ci
+           AND DATE_FORMAT(r.attendance_date, '%Y-%m') = ?
+         WHERE u.is_active = 1
+           AND JSON_CONTAINS(u.module_access, '"Attendance"')
+         GROUP BY u.user_id, u.fullname, prof.department
+         ORDER BY u.fullname ASC`,
+        [monthStr, monthStr]
+      );
+
+      const reportRows = rows.map((r) => {
+        const present = Number(r.days_present) || 0;
+        const late = Number(r.days_late) || 0;
+        const leave = Number(r.days_leave) || 0;
+        const workedMinutes = Number(r.total_worked_minutes) || 0;
+        const expectedMinutes = present * 480;
+        const deductedMinutes = Math.max(0, expectedMinutes - workedMinutes);
+
+        return {
+          user_id: r.user_id,
+          fullname: r.fullname,
+          department: r.department || '',
+          days_present: present,
+          days_late: late,
+          days_leave: leave,
+          days_absent: Math.max(0, 22 - present - leave),
+          total_worked_minutes: workedMinutes,
+          total_deducted_minutes: deductedMinutes,
+        };
+      });
+
+      if (format === 'csv') {
+        const csvStr = toCsv(reportRows, [
+          { key: 'user_id', label: 'Employee ID' },
+          { key: 'fullname', label: 'Name' },
+          { key: 'department', label: 'Department' },
+          { key: 'days_present', label: 'Days Present' },
+          { key: 'days_late', label: 'Days Late' },
+          { key: 'days_leave', label: 'Days Leave' },
+          { key: 'days_absent', label: 'Days Absent' },
+          { key: 'total_worked_minutes', label: 'Total Worked Minutes' },
+          { key: 'total_deducted_minutes', label: 'Total Deducted Minutes' },
+        ]);
+        res.setHeader('Content-Type', 'text/csv');
+        res.setHeader('Content-Disposition', `attachment; filename="attendance-report-${monthStr}.csv"`);
+        return res.status(200).send(csvStr);
+      }
+
+      return res.status(200).json({
+        success: true,
+        data: {
+          month: monthStr,
+          report: reportRows,
+        },
+      });
+    } catch (err) {
+      next(err);
+    }
+  },
+
+  /**
+   * GET /api/attendance/admin/attempts
+   */
+  async adminGetAttempts(req, res, next) {
+    try {
+      const { user, date, success, limit, offset } = req.query;
+      const result = await AttendanceAttemptModel.findAll({
+        userId: user,
+        date,
+        success,
+        limit,
+        offset,
+      });
+      return res.status(200).json({
+        success: true,
+        data: result,
+      });
+    } catch (err) {
+      next(err);
+    }
+  },
+
+  // ── Regularizations & Records ────────────────────────────────────────────
+
+  /**
+   * GET /api/attendance/admin/regularizations
+   */
+  async adminGetRegularizations(req, res, next) {
+    try {
+      const { status, limit, offset } = req.query;
+      const requests = await AttendanceRegularizationModel.findAll({ status, limit, offset });
+      return res.status(200).json({
+        success: true,
+        data: { regularizations: requests },
+      });
+    } catch (err) {
+      next(err);
+    }
+  },
+
+  /**
+   * POST /api/attendance/admin/regularizations/:id/approve
+   */
+  async adminApproveRegularization(req, res, next) {
+    try {
+      const id = req.params.id;
+      const reg = await AttendanceRegularizationModel.findById(id);
+      if (!reg) throw httpError(404, 'Regularization request not found.');
+      if (reg.status !== 'PENDING') {
+        throw httpError(409, 'Only PENDING regularization requests can be approved.');
+      }
+
+      const { checkInTime, checkOutTime, status } = req.body || {};
+      if (!checkInTime || !/^\d{2}:\d{2}(:\d{2})?$/.test(String(checkInTime))) {
+        throw httpError(400, 'checkInTime is required as HH:mm.');
+      }
+      if (!checkOutTime || !/^\d{2}:\d{2}(:\d{2})?$/.test(String(checkOutTime))) {
+        throw httpError(400, 'checkOutTime is required as HH:mm.');
+      }
+      if (!status || !['PRESENT', 'LATE'].includes(status)) {
+        throw httpError(400, 'status must be PRESENT or LATE.');
+      }
+
+      const inDate = istDateTimeToUtc(reg.attendance_date, checkInTime);
+      const outDate = istDateTimeToUtc(reg.attendance_date, checkOutTime);
+      if (outDate <= inDate) {
+        throw httpError(400, 'checkOutTime must be after checkInTime.');
+      }
+
+      const workedMinutes = Math.round((outDate.getTime() - inDate.getTime()) / 60000);
+      const checkInUtc = toUtcDateTime(inDate);
+      const checkOutUtc = toUtcDateTime(outDate);
+
+      const profile = await AttendanceProfileModel.findByUserId(reg.user_id);
+      const upsertResult = await AttendanceRecordModel.upsertForRegularization({
+        userId: reg.user_id,
+        attendanceDate: reg.attendance_date,
+        fullname: reg.fullname || 'Employee',
+        officeId: profile?.office_id || 1,
+        checkInAt: checkInUtc,
+        checkOutAt: checkOutUtc,
+        status,
+        workedMinutes,
+      });
+
+      await AttendanceRegularizationModel.updateStatus(id, {
+        status: 'APPROVED',
+        reviewedBy: req.admin.id,
+      });
+
+      await AttendanceAuditLogModel.log({
+        actorAdminId: req.admin.id,
+        action: 'regularization_approve',
+        entityType: 'regularization',
+        entityId: id,
+        beforeJson: reg,
+        afterJson: {
+          ...reg,
+          status: 'APPROVED',
+          check_in_at: checkInUtc,
+          check_out_at: checkOutUtc,
+          worked_minutes: workedMinutes,
+        },
+      });
+
+      return res.status(200).json({
+        success: true,
+        message: 'Regularization approved and attendance record updated',
+        data: { record: upsertResult.record },
+      });
+    } catch (err) {
+      next(err);
+    }
+  },
+
+  /**
+   * POST /api/attendance/admin/regularizations/:id/reject
+   */
+  async adminRejectRegularization(req, res, next) {
+    try {
+      const id = req.params.id;
+      const reg = await AttendanceRegularizationModel.findById(id);
+      if (!reg) throw httpError(404, 'Regularization request not found.');
+      if (reg.status !== 'PENDING') {
+        throw httpError(409, 'Only PENDING regularization requests can be rejected.');
+      }
+
+      await AttendanceRegularizationModel.updateStatus(id, {
+        status: 'REJECTED',
+        reviewedBy: req.admin.id,
+      });
+
+      await AttendanceAuditLogModel.log({
+        actorAdminId: req.admin.id,
+        action: 'regularization_reject',
+        entityType: 'regularization',
+        entityId: id,
+        beforeJson: reg,
+        afterJson: { ...reg, status: 'REJECTED' },
+      });
+
+      return res.status(200).json({
+        success: true,
+        message: 'Regularization rejected successfully',
+      });
+    } catch (err) {
+      next(err);
+    }
+  },
+
+  /**
+   * PATCH /api/attendance/admin/records/:id
+   */
+  async adminPatchRecord(req, res, next) {
+    try {
+      const id = req.params.id;
+      const existing = await AttendanceRecordModel.findById(id);
+      if (!existing) throw httpError(404, 'Attendance record not found.');
+
+      const { check_in_at, check_out_at, status, reason } = req.body || {};
+      if (!reason || typeof reason !== 'string' || reason.trim().length < 10) {
+        throw httpError(400, 'A reason of at least 10 characters is required for manual record adjustments.');
+      }
+
+      // Allow only check_in_at, check_out_at, status
+      const newCheckIn = check_in_at ? toUtcDateTime(check_in_at) : existing.check_in_at;
+      const newCheckOut = check_out_at ? toUtcDateTime(check_out_at) : existing.check_out_at;
+
+      let workedMinutes = existing.worked_minutes;
+      if (newCheckIn && newCheckOut) {
+        const inDate = fromUtcDateTime(newCheckIn);
+        const outDate = fromUtcDateTime(newCheckOut);
+        if (outDate <= inDate) {
+          throw httpError(400, 'check_out_at must be after check_in_at.');
+        }
+        if (
+          istCalendarDate(inDate) !== existing.attendance_date ||
+          istCalendarDate(outDate) !== existing.attendance_date
+        ) {
+          throw httpError(400, 'Both check_in_at and check_out_at must be on the same IST date as attendance_date.');
+        }
+        workedMinutes = Math.round((outDate.getTime() - inDate.getTime()) / 60000);
+      }
+
+      await AttendanceRecordModel.updateRecordAdmin(id, {
+        checkInAt: newCheckIn,
+        checkOutAt: newCheckOut,
+        status: status || existing.status,
+        workedMinutes,
+      });
+
+      const updated = await AttendanceRecordModel.findById(id);
+
+      await AttendanceAuditLogModel.log({
+        actorAdminId: req.admin.id,
+        action: 'record_patch',
+        entityType: 'record',
+        entityId: id,
+        beforeJson: existing,
+        afterJson: { ...updated, reason: reason.trim() },
+      });
+
+      return res.status(200).json({
+        success: true,
+        message: 'Attendance record updated successfully',
+        data: { record: updated },
+      });
+    } catch (err) {
+      next(err);
+    }
+  },
+
+  // ── Leaves ───────────────────────────────────────────────────────────────
+
+  /**
+   * POST /api/attendance/admin/leaves
+   */
+  async adminCreateLeave(req, res, next) {
+    try {
+      const { userId, fromDate, toDate, reason } = req.body || {};
+      if (!userId || typeof userId !== 'string') throw httpError(400, 'userId is required.');
+
+      const siteUser = await SiteUserModel.findById(userId);
+      if (!siteUser) throw httpError(404, 'Site user not found.');
+
+      const modules = Array.isArray(siteUser.moduleAccess)
+        ? siteUser.moduleAccess
+        : (Array.isArray(siteUser.module_access)
+            ? siteUser.module_access
+            : JSON.parse(siteUser.module_access || '[]'));
+      if (!modules.includes('Attendance')) {
+        throw httpError(400, 'User does not have access to the Attendance module.');
+      }
+
+      const from = parseIsoDate(fromDate, 'fromDate');
+      const to = parseIsoDate(toDate, 'toDate');
+      if (from > to) throw httpError(400, 'fromDate must be before or equal to toDate.');
+
+      // Check overlapping approved leaves
+      const overlap = await AttendanceLeaveModel.findOverlapping(userId, from, to);
+      if (overlap.length > 0) {
+        throw httpError(409, 'Leave already approved for one or more dates in this period.');
+      }
+
+      const result = await AttendanceLeaveModel.createApprovedSpan({
+        userId,
+        fromDate: from,
+        toDate: to,
+        reason: reason || 'Approved Leave',
+        reviewedBy: req.admin.id,
+      });
+
+      await AttendanceAuditLogModel.log({
+        actorAdminId: req.admin.id,
+        action: 'leave_create',
+        entityType: 'leave',
+        entityId: userId,
+        afterJson: { userId, fromDate: from, toDate: to, reason, count: result.count },
+      });
+
+      return res.status(201).json({
+        success: true,
+        message: 'Leave approved successfully',
+        data: result,
+      });
+    } catch (err) {
+      next(err);
+    }
+  },
+
+  /**
+   * GET /api/attendance/admin/leaves
+   */
+  async adminGetLeaves(req, res, next) {
+    try {
+      const { user, month, status, limit, offset } = req.query;
+      const leaves = await AttendanceLeaveModel.findAll({
+        userId: user,
+        month,
+        status,
+        limit,
+        offset,
+      });
+      return res.status(200).json({
+        success: true,
+        data: { leaves },
+      });
+    } catch (err) {
+      next(err);
+    }
+  },
+
+  /**
+   * PATCH or DELETE /api/attendance/admin/leaves/:id
+   */
+  async adminCancelLeave(req, res, next) {
+    try {
+      const id = req.params.id;
+      const existing = await AttendanceLeaveModel.findById(id);
+      if (!existing) throw httpError(404, 'Leave record not found.');
+
+      await AttendanceLeaveModel.cancelLeave(id, req.admin.id);
+
+      await AttendanceAuditLogModel.log({
+        actorAdminId: req.admin.id,
+        action: 'leave_cancel',
+        entityType: 'leave',
+        entityId: id,
+        beforeJson: existing,
+        afterJson: { ...existing, status: 'REJECTED' },
+      });
+
+      return res.status(200).json({
+        success: true,
+        message: 'Leave cancelled successfully',
       });
     } catch (err) {
       next(err);
