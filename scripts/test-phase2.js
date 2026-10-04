@@ -19,6 +19,7 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const app = require('../src/app');
 const { pool } = require('../src/config/db');
+const AttendancePresenceModel = require('../src/models/attendancePresence.model');
 const { toUtcDateTime, istCalendarDate } = require('../src/utils/time');
 const { recordAttempt } = require('../src/services/attendanceGate');
 
@@ -571,13 +572,41 @@ async function runTests() {
       });
       record('accuracy 100 with d 900 becomes OUTSIDE (reason "left")', resOutside900.body?.data?.state === 'OUTSIDE' && resOutside900.body?.data?.reason === 'left');
 
-      // 18d. Return rule: Returning physically inside does NOT reset state to INSIDE via heartbeat alone
+      // 18d. Weak readings x3 while OUTSIDE stay OUTSIDE
+      await api('/api/attendance/heartbeat', {
+        method: 'POST',
+        token: tokenEmployee1,
+        body: { lat: OFFICE_LAT, lng: OFFICE_LNG, accuracy: 5000 },
+      });
+      await api('/api/attendance/heartbeat', {
+        method: 'POST',
+        token: tokenEmployee1,
+        body: { lat: OFFICE_LAT, lng: OFFICE_LNG, accuracy: 5000 },
+      });
+      const resWeak3Outside = await api('/api/attendance/heartbeat', {
+        method: 'POST',
+        token: tokenEmployee1,
+        body: { lat: OFFICE_LAT, lng: OFFICE_LNG, accuracy: 5000 },
+      });
+      record('weak readings x3 while OUTSIDE stay OUTSIDE', resWeak3Outside.body?.data?.state === 'OUTSIDE' && resWeak3Outside.body?.data?.reason === 'left');
+
+      // 18e. Return rule: Returning physically inside does NOT reset state to INSIDE via heartbeat alone
       const resReturn = await api('/api/attendance/heartbeat', {
         method: 'POST',
         token: tokenEmployee1,
         body: { lat: OFFICE_LAT, lng: OFFICE_LNG, accuracy: 10 },
       });
-      record('Return flow: heartbeat alone keeps presence OUTSIDE until reverify', resReturn.body?.data?.state === 'OUTSIDE');
+      const returnStateOutside = resReturn.body?.data?.state === 'OUTSIDE';
+      const returnReverifyReq = resReturn.body?.data?.reverifyRequired === true;
+      record('Return flow: heartbeat alone keeps presence OUTSIDE until reverify', returnStateOutside);
+
+      // Verify me/status also shows reverifyRequired true
+      const statusWhileOutsideReturn = await api('/api/attendance/me/status', {
+        method: 'GET',
+        token: tokenEmployee1,
+      });
+      const statusReverifyReq = statusWhileOutsideReturn.body?.data?.reverifyRequired === true;
+      record('left then returned shows reverifyRequired true on the first inside heartbeat', returnReverifyReq && statusReverifyReq);
     }
 
     // Test 19: Re-verify restores INSIDE state
@@ -609,6 +638,60 @@ async function runTests() {
         },
       });
       record('Re-verification inside office restores presence to INSIDE', res.status === 200 && res.body?.data?.state === 'INSIDE');
+
+      // Check me/status: reverifyRequired must now be false
+      const statusAfterReverify = await api('/api/attendance/me/status', {
+        method: 'GET',
+        token: tokenEmployee1,
+      });
+      const reverifyFalse = statusAfterReverify.body?.data?.reverifyRequired === false && statusAfterReverify.body?.data?.presenceState === 'INSIDE';
+      record('reverifyRequired false after /reverify', reverifyFalse);
+
+      // 19b. UNKNOWN with left_alerted_at set plus an inside reading shows reverifyRequired true
+      await pool.query(
+        "UPDATE attendance_presence SET state = 'UNKNOWN', reason = 'no_signal', left_alerted_at = UTC_TIMESTAMP() WHERE user_id = ?",
+        [FIXTURE_USER_1]
+      );
+      const resUnknownInside = await api('/api/attendance/heartbeat', {
+        method: 'POST',
+        token: tokenEmployee1,
+        body: { lat: OFFICE_LAT, lng: OFFICE_LNG, accuracy: 10 },
+      });
+      const statusUnknown = await api('/api/attendance/me/status', {
+        method: 'GET',
+        token: tokenEmployee1,
+      });
+      const unknownAlertedReverify =
+        resUnknownInside.body?.data?.state === 'UNKNOWN' &&
+        resUnknownInside.body?.data?.reverifyRequired === true &&
+        statusUnknown.body?.data?.presenceState === 'UNKNOWN' &&
+        statusUnknown.body?.data?.reverifyRequired === true;
+      record('UNKNOWN with left_alerted_at set plus an inside reading shows reverifyRequired true', unknownAlertedReverify);
+
+      // Restore to INSIDE before concurrency test
+      await pool.query(
+        "UPDATE attendance_presence SET state = 'INSIDE', reason = NULL, left_alerted_at = NULL WHERE user_id = ?",
+        [FIXTURE_USER_1]
+      );
+
+      // 19c. Concurrent state change returns the current state
+      const origUpdate = AttendancePresenceModel.updateConditional;
+      AttendancePresenceModel.updateConditional = async function (...args) {
+        // Concurrently change state in DB to 'OUTSIDE' so expectedState: 'INSIDE' condition fails (0 rows affected)
+        await pool.query("UPDATE attendance_presence SET state = 'OUTSIDE', reason = 'left' WHERE user_id = ?", [FIXTURE_USER_1]);
+        return origUpdate.apply(this, args);
+      };
+      try {
+        const resConcurrent = await api('/api/attendance/heartbeat', {
+          method: 'POST',
+          token: tokenEmployee1,
+          body: { lat: OFFICE_LAT, lng: OFFICE_LNG, accuracy: 10 },
+        });
+        const concurrentHandled = resConcurrent.status === 200 && resConcurrent.body?.data?.state === 'OUTSIDE';
+        record('concurrent state change returns the current state', concurrentHandled);
+      } finally {
+        AttendancePresenceModel.updateConditional = origUpdate;
+      }
     }
 
     // Test 20: Check-out from any location (allowed outside radius)

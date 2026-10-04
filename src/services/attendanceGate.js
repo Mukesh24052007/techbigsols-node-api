@@ -220,11 +220,6 @@ async function applyPresenceTransition({
     return { state: nextState, lastInsideAt, outsideSince };
   }
 
-  if (presence.state !== nextState) {
-    await AttendanceIntervalModel.closeOpen(recordId, utc);
-    await AttendanceIntervalModel.open(null, { recordId, state: nextState, startedAt: utc });
-  }
-
   const updated = await AttendancePresenceModel.updateConditional({
     recordId,
     expectedState: expectedState !== undefined ? expectedState : undefined,
@@ -241,6 +236,11 @@ async function applyPresenceTransition({
     outsideSince,
     leftAlertedAt: nextState === 'INSIDE' ? null : undefined,
   });
+
+  if (updated && presence.state !== nextState) {
+    await AttendanceIntervalModel.closeOpen(recordId, utc);
+    await AttendanceIntervalModel.open(null, { recordId, state: nextState, startedAt: utc });
+  }
 
   return { success: updated, state: nextState, lastInsideAt, outsideSince };
 }

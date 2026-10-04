@@ -77,6 +77,20 @@ const AttendanceController = {
       const presence = todayRecord ? await AttendancePresenceModel.findByRecordId(todayRecord.id) : null;
       const pendingTask = todayRecord ? await AttendanceReverifyModel.pendingForRecord(todayRecord.id) : null;
 
+      let reverifyRequired = false;
+      if (presence && office && presence.last_lat != null && presence.last_lng != null) {
+        const isOutsideOrAlertedUnknown =
+          presence.state === 'OUTSIDE' || (presence.state === 'UNKNOWN' && Boolean(presence.left_alerted_at));
+        if (isOutsideOrAlertedUnknown) {
+          const d = haversineMetres(Number(office.lat), Number(office.lng), Number(presence.last_lat), Number(presence.last_lng));
+          const a = Number(presence.last_accuracy) || 0;
+          const R = Number(office.radius_m);
+          const L = Number(office.accuracy_max_m) || 50;
+          const cap = 4 * L;
+          reverifyRequired = a <= cap && d <= R;
+        }
+      }
+
       return res.status(200).json({
         success: true,
         data: {
@@ -86,6 +100,7 @@ const AttendanceController = {
           consentAt: profile.consent_at,
           todayRecord,
           presenceState: presence ? presence.state : null,
+          reverifyRequired,
           reverifyPending: Boolean(pendingTask),
           reverifyDueAt: pendingTask?.due_at || null,
         },
@@ -295,11 +310,21 @@ const AttendanceController = {
 
       if (a > cap) {
         // a > cap: WEAK (proves nothing). Do not refresh last_inside_at; weak_streak += 1;
-        // at weak_streak >= 3 set UNKNOWN with reason "weak_gps".
+        // weak_streak -> UNKNOWN applies only when the current state is INSIDE.
+        // A weak reading must never change state when OUTSIDE (keep OUTSIDE/"left");
+        // Keep UNKNOWN as UNKNOWN.
         nextWeakStreak = currentWeakStreak + 1;
-        if (nextWeakStreak >= 3) {
+        if (presence.state === 'INSIDE') {
+          if (nextWeakStreak >= 3) {
+            nextState = 'UNKNOWN';
+            nextReason = 'weak_gps';
+          }
+        } else if (presence.state === 'OUTSIDE') {
+          nextState = 'OUTSIDE';
+          nextReason = 'left';
+        } else if (presence.state === 'UNKNOWN') {
           nextState = 'UNKNOWN';
-          nextReason = 'weak_gps';
+          nextReason = presence.reason;
         }
       } else if (d + a <= R) {
         // else if d + a <= R: INSIDE proven. Refresh last_inside_at; reset weak_streak and outside_streak.
@@ -360,8 +385,9 @@ const AttendanceController = {
       const now = new Date();
       const nowUtc = toUtcDateTime(now);
 
+      let writeSuccess = true;
       if (nextState !== presence.state) {
-        await applyPresenceTransition({
+        const transRes = await applyPresenceTransition({
           recordId: record.id,
           userId,
           nextState,
@@ -374,8 +400,9 @@ const AttendanceController = {
           accuracy,
           expectedState: presence.state,
         });
+        writeSuccess = transRes.success !== false;
       } else {
-        await AttendancePresenceModel.updateConditional({
+        writeSuccess = await AttendancePresenceModel.updateConditional({
           recordId: record.id,
           expectedState: presence.state,
           state: nextState,
@@ -391,14 +418,27 @@ const AttendanceController = {
         });
       }
 
-      const pendingTask = await AttendanceReverifyModel.pendingForRecord(record.id);
+      // Re-read latest presence from DB (if conditional write affected 0 rows, latestPresence has the current concurrent state)
       const latestPresence = await AttendancePresenceModel.findByRecordId(record.id);
+      const pendingTask = await AttendanceReverifyModel.pendingForRecord(record.id);
+
+      const finalState = latestPresence ? latestPresence.state : nextState;
+      const finalReason = latestPresence ? latestPresence.reason : nextReason;
+      const finalLeftAlertedAt = latestPresence ? latestPresence.left_alerted_at : presence.left_alerted_at;
+
+      // reverifyRequired: true when presence.state is OUTSIDE, or UNKNOWN with left_alerted_at set,
+      // AND the latest reading was proven-inside or probably-inside (d <= R, not weak: a <= cap).
+      const isOutsideOrAlertedUnknown =
+        finalState === 'OUTSIDE' || (finalState === 'UNKNOWN' && Boolean(finalLeftAlertedAt));
+      const isInsideReading = a <= cap && d <= R;
+      const reverifyRequired = Boolean(isOutsideOrAlertedUnknown && isInsideReading);
 
       return res.status(200).json({
         success: true,
         data: {
-          state: latestPresence.state,
-          reason: latestPresence.reason || null,
+          state: finalState,
+          reason: finalReason || null,
+          reverifyRequired,
           reverifyPending: Boolean(pendingTask),
           reverifyDueAt: pendingTask?.due_at || null,
           lastHeartbeatAt: now.toISOString(),
