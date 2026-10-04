@@ -215,6 +215,7 @@ const migrate = async () => {
             shift_end                  TIME          NOT NULL DEFAULT '18:30:00',
             grace_minutes              INT           NOT NULL DEFAULT 10,
             outside_tolerance_minutes  INT           NOT NULL DEFAULT 10,
+            short_outing_allowance_minutes INT       NOT NULL DEFAULT 30,
             heartbeat_seconds          INT           NOT NULL DEFAULT 60,
             reverify_count             INT           NOT NULL DEFAULT 2,
             created_at                 DATETIME      NOT NULL,
@@ -278,13 +279,16 @@ const migrate = async () => {
             record_id          INT          NOT NULL PRIMARY KEY,
             user_id            VARCHAR(20)  NOT NULL,
             state              ENUM('INSIDE','OUTSIDE','UNKNOWN') NOT NULL DEFAULT 'INSIDE',
+            reason             VARCHAR(32)  DEFAULT NULL,
             outside_streak     INT          NOT NULL DEFAULT 0,
+            weak_streak        INT          NOT NULL DEFAULT 0,
             last_heartbeat_at  DATETIME     DEFAULT NULL,
             last_inside_at     DATETIME     DEFAULT NULL,
             outside_since      DATETIME     DEFAULT NULL,
             last_lat           DECIMAL(10,7) DEFAULT NULL,
             last_lng           DECIMAL(10,7) DEFAULT NULL,
             last_accuracy      DECIMAL(8,2)  DEFAULT NULL,
+            left_alerted_at    DATETIME     DEFAULT NULL,
             updated_at         DATETIME     NOT NULL,
             INDEX idx_att_presence_user (user_id),
             INDEX idx_att_presence_state (state)
@@ -422,14 +426,28 @@ const migrate = async () => {
       console.warn(`\n⚠️  ${failedAttendanceTables.length} attendance table(s) failed: ${failedAttendanceTables.join(', ')}`);
     }
 
-    // ── Guarded upgrade: add outside_streak to attendance_presence if missing ──
+    // ── Guarded upgrade: add columns to attendance_presence if missing ──
     try {
-      if (await tableExists('attendance_presence') && !(await columnExists('attendance_presence', 'outside_streak'))) {
-        await pool.query(`ALTER TABLE attendance_presence ADD COLUMN outside_streak INT NOT NULL DEFAULT 0 AFTER state`);
-        console.log('✅ attendance_presence: outside_streak column added');
+      if (await tableExists('attendance_presence')) {
+        if (!(await columnExists('attendance_presence', 'outside_streak'))) {
+          await pool.query(`ALTER TABLE attendance_presence ADD COLUMN outside_streak INT NOT NULL DEFAULT 0 AFTER state`);
+          console.log('✅ attendance_presence: outside_streak column added');
+        }
+        if (!(await columnExists('attendance_presence', 'reason'))) {
+          await pool.query(`ALTER TABLE attendance_presence ADD COLUMN reason VARCHAR(32) DEFAULT NULL AFTER state`);
+          console.log('✅ attendance_presence: reason column added');
+        }
+        if (!(await columnExists('attendance_presence', 'weak_streak'))) {
+          await pool.query(`ALTER TABLE attendance_presence ADD COLUMN weak_streak INT NOT NULL DEFAULT 0 AFTER outside_streak`);
+          console.log('✅ attendance_presence: weak_streak column added');
+        }
+        if (!(await columnExists('attendance_presence', 'left_alerted_at'))) {
+          await pool.query(`ALTER TABLE attendance_presence ADD COLUMN left_alerted_at DATETIME DEFAULT NULL AFTER last_accuracy`);
+          console.log('✅ attendance_presence: left_alerted_at column added');
+        }
       }
     } catch (err) {
-      console.warn('⚠️  attendance_presence: could not add outside_streak —', err.message);
+      console.warn('⚠️  attendance_presence: could not add columns —', err.message);
     }
 
     // ── Guarded upgrade: add checkout coordinates to attendance_records if missing ──
@@ -437,16 +455,31 @@ const migrate = async () => {
       if (await tableExists('attendance_records')) {
         if (!(await columnExists('attendance_records', 'check_out_lat'))) {
           await pool.query(`ALTER TABLE attendance_records ADD COLUMN check_out_lat DECIMAL(10,7) DEFAULT NULL AFTER check_in_accuracy`);
+          console.log('✅ attendance_records: check_out_lat column added');
         }
         if (!(await columnExists('attendance_records', 'check_out_lng'))) {
           await pool.query(`ALTER TABLE attendance_records ADD COLUMN check_out_lng DECIMAL(10,7) DEFAULT NULL AFTER check_out_lat`);
+          console.log('✅ attendance_records: check_out_lng column added');
         }
         if (!(await columnExists('attendance_records', 'check_out_accuracy'))) {
           await pool.query(`ALTER TABLE attendance_records ADD COLUMN check_out_accuracy DECIMAL(8,2) DEFAULT NULL AFTER check_out_lng`);
+          console.log('✅ attendance_records: check_out_accuracy column added');
         }
       }
     } catch (err) {
       console.warn('⚠️  attendance_records: could not add check_out columns —', err.message);
+    }
+
+    // ── Guarded upgrade: add short_outing_allowance_minutes to attendance_offices if missing ──
+    try {
+      if (await tableExists('attendance_offices')) {
+        if (!(await columnExists('attendance_offices', 'short_outing_allowance_minutes'))) {
+          await pool.query(`ALTER TABLE attendance_offices ADD COLUMN short_outing_allowance_minutes INT NOT NULL DEFAULT 30 AFTER outside_tolerance_minutes`);
+          console.log('✅ attendance_offices: short_outing_allowance_minutes column added');
+        }
+      }
+    } catch (err) {
+      console.warn('⚠️  attendance_offices: could not add short_outing_allowance_minutes —', err.message);
     }
 
     console.log('\n🎉 All migrations completed successfully.');

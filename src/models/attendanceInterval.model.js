@@ -34,6 +34,19 @@ const AttendanceIntervalModel = {
     return rows[0] || null;
   },
 
+  async findAllByRecord(recordId, conn) {
+    const sql = `
+      SELECT id, record_id, state,
+             DATE_FORMAT(started_at, '%Y-%m-%d %H:%i:%s') AS started_at,
+             DATE_FORMAT(ended_at, '%Y-%m-%d %H:%i:%s') AS ended_at
+      FROM attendance_intervals
+      WHERE record_id = ?
+      ORDER BY started_at ASC, id ASC
+    `;
+    const [rows] = conn ? await conn.query(sql, [recordId]) : await pool.query(sql, [recordId]);
+    return rows;
+  },
+
   async sumInsideMinutes(recordId, untilUtc) {
     const [rows] = await pool.query(
       `SELECT COALESCE(SUM(

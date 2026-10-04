@@ -18,6 +18,8 @@ const {
   replayEpsilon,
 } = require('../utils/faceMath');
 const { toUtcDateTime, istCalendarDate } = require('../utils/time');
+const { computeWorkedMinutes } = require('../utils/workedMinutes');
+const attendanceBus = require('../services/attendanceBus');
 
 const {
   loadProfileAndOffice,
@@ -230,6 +232,12 @@ const AttendanceController = {
         ip,
       });
 
+      attendanceBus.emit('checkin', {
+        employeeId: userId,
+        name: req.siteUser.fullname,
+        time: record.check_in_at,
+      });
+
       return res.status(200).json({
         success: true,
         message: 'Check-in successful',
@@ -269,71 +277,108 @@ const AttendanceController = {
         throw httpError(400, 'Assigned office was not found.');
       }
 
-      const dist = haversineMetres(Number(lat), Number(lng), Number(office.lat), Number(office.lng));
-      const presence = await AttendancePresenceModel.findByRecordId(record.id);
+      const L = Number(office.accuracy_max_m) || 50;
+      const R = Number(office.radius_m) || 150;
+      const cap = 4 * L;
+      const d = haversineMetres(Number(lat), Number(lng), Number(office.lat), Number(office.lng));
+      const a = Number(accuracy);
 
-      const isReadingOutside = dist > office.radius_m;
-      const isDefinitivelyOutside = (dist - accuracy) > office.radius_m;
-      const currentStreak = presence?.outside_streak || 0;
-      const newStreak = isReadingOutside ? currentStreak + 1 : 0;
+      const presence = await AttendancePresenceModel.findByRecordId(record.id);
+      const currentWeakStreak = presence?.weak_streak || 0;
+      const currentOutsideStreak = presence?.outside_streak || 0;
+
+      let nextState = presence.state;
+      let nextReason = presence.reason || null;
+      let nextWeakStreak = currentWeakStreak;
+      let nextOutsideStreak = currentOutsideStreak;
+      let shouldRefreshLastInside = false;
+
+      if (a > cap) {
+        // a > cap: WEAK (proves nothing). Do not refresh last_inside_at; weak_streak += 1;
+        // at weak_streak >= 3 set UNKNOWN with reason "weak_gps".
+        nextWeakStreak = currentWeakStreak + 1;
+        if (nextWeakStreak >= 3) {
+          nextState = 'UNKNOWN';
+          nextReason = 'weak_gps';
+        }
+      } else if (d + a <= R) {
+        // else if d + a <= R: INSIDE proven. Refresh last_inside_at; reset weak_streak and outside_streak.
+        nextWeakStreak = 0;
+        nextOutsideStreak = 0;
+        if (presence.state === 'OUTSIDE') {
+          // Return flow: once outside, stays outside until /reverify passes
+          nextState = 'OUTSIDE';
+          nextReason = 'left';
+          shouldRefreshLastInside = false;
+        } else {
+          nextState = 'INSIDE';
+          nextReason = null;
+          shouldRefreshLastInside = true;
+        }
+      } else if (d - a > R) {
+        // else if d - a > R: OUTSIDE proven (even if a > L). Apply the existing "return flow" and outside_streak logic; reset weak_streak.
+        nextWeakStreak = 0;
+        nextOutsideStreak = currentOutsideStreak + 1;
+        nextState = 'OUTSIDE';
+        nextReason = 'left';
+      } else if (d <= R) {
+        // else if d <= R: probably inside (uncertainty circle crosses the border). Treat as inside: refresh last_inside_at, reset weak_streak, do not increase outside_streak.
+        nextWeakStreak = 0;
+        if (presence.state === 'OUTSIDE') {
+          nextState = 'OUTSIDE';
+          nextReason = 'left';
+        } else {
+          nextState = 'INSIDE';
+          nextReason = null;
+          shouldRefreshLastInside = true;
+        }
+      } else {
+        // else (d > R but circle overlaps the office): ambiguous outside. outside_streak += 1; reset weak_streak; at outside_streak >= 2 set OUTSIDE.
+        nextWeakStreak = 0;
+        nextOutsideStreak = currentOutsideStreak + 1;
+        if (presence.state === 'OUTSIDE') {
+          nextState = 'OUTSIDE';
+          nextReason = 'left';
+        } else if (nextOutsideStreak >= 2) {
+          nextState = 'OUTSIDE';
+          nextReason = 'left';
+        } else {
+          nextState = presence.state;
+        }
+      }
 
       const now = new Date();
       const nowUtc = toUtcDateTime(now);
 
-      if (isReadingOutside && (isDefinitivelyOutside || newStreak >= 2)) {
-        if (presence?.state !== 'OUTSIDE') {
-          await applyPresenceTransition({
-            recordId: record.id,
-            userId,
-            nextState: 'OUTSIDE',
-            outsideStreak: newStreak,
-            at: now,
-            lat,
-            lng,
-            accuracy,
-          });
-        } else {
-          await AttendancePresenceModel.updateHeartbeat({
-            recordId: record.id,
-            state: 'OUTSIDE',
-            outsideStreak: newStreak,
-            at: nowUtc,
-            lat,
-            lng,
-            accuracy,
-            lastInsideAt: presence.last_inside_at,
-            outsideSince: presence.outside_since,
-          });
-        }
+      if (nextState !== presence.state) {
+        await applyPresenceTransition({
+          recordId: record.id,
+          userId,
+          nextState,
+          reason: nextReason,
+          outsideStreak: nextOutsideStreak,
+          weakStreak: nextWeakStreak,
+          at: now,
+          lat,
+          lng,
+          accuracy,
+          expectedState: presence.state,
+        });
       } else {
-        // Reading is inside radius, or outside reading with poor accuracy and streak < 2
-        if (presence?.state === 'OUTSIDE') {
-          // Return flow rule: presence stays OUTSIDE until /reverify passes
-          await AttendancePresenceModel.updateHeartbeat({
-            recordId: record.id,
-            state: 'OUTSIDE',
-            outsideStreak: newStreak,
-            at: nowUtc,
-            lat,
-            lng,
-            accuracy,
-            lastInsideAt: presence.last_inside_at,
-            outsideSince: presence.outside_since,
-          });
-        } else {
-          // Stays INSIDE
-          await AttendancePresenceModel.updateHeartbeat({
-            recordId: record.id,
-            state: 'INSIDE',
-            outsideStreak: 0,
-            at: nowUtc,
-            lat,
-            lng,
-            accuracy,
-            lastInsideAt: nowUtc,
-            outsideSince: null,
-          });
-        }
+        await AttendancePresenceModel.updateConditional({
+          recordId: record.id,
+          expectedState: presence.state,
+          state: nextState,
+          reason: nextReason,
+          outsideStreak: nextOutsideStreak,
+          weakStreak: nextWeakStreak,
+          at: nowUtc,
+          lat,
+          lng,
+          accuracy,
+          lastInsideAt: shouldRefreshLastInside ? nowUtc : presence.last_inside_at,
+          outsideSince: nextState === 'OUTSIDE' ? (presence.outside_since || nowUtc) : null,
+        });
       }
 
       const pendingTask = await AttendanceReverifyModel.pendingForRecord(record.id);
@@ -343,6 +388,7 @@ const AttendanceController = {
         success: true,
         data: {
           state: latestPresence.state,
+          reason: latestPresence.reason || null,
           reverifyPending: Boolean(pendingTask),
           reverifyDueAt: pendingTask?.due_at || null,
           lastHeartbeatAt: now.toISOString(),
@@ -422,13 +468,16 @@ const AttendanceController = {
 
       const now = new Date();
       const presence = await AttendancePresenceModel.findByRecordId(record.id);
+      const wasOutside = presence?.state === 'OUTSIDE';
 
       if (presence?.state === 'OUTSIDE' || presence?.state === 'UNKNOWN') {
         await applyPresenceTransition({
           recordId: record.id,
           userId,
           nextState: 'INSIDE',
+          reason: null,
           outsideStreak: 0,
+          weakStreak: 0,
           at: now,
           lat,
           lng,
@@ -440,6 +489,20 @@ const AttendanceController = {
       if (pendingTask) {
         await AttendanceReverifyModel.complete(pendingTask.id, toUtcDateTime(now));
       }
+
+      if (wasOutside) {
+        attendanceBus.emit('returned', {
+          employeeId: userId,
+          name: req.siteUser.fullname,
+          time: toUtcDateTime(now),
+        });
+      }
+
+      attendanceBus.emit('reverify', {
+        employeeId: userId,
+        name: req.siteUser.fullname,
+        time: toUtcDateTime(now),
+      });
 
       return res.status(200).json({
         success: true,
@@ -484,8 +547,16 @@ const AttendanceController = {
       // Close open presence interval
       await AttendanceIntervalModel.closeOpen(record.id, utc);
 
-      // Sum strictly inside minutes
-      const workedMinutes = await AttendanceIntervalModel.sumInsideMinutes(record.id, utc);
+      // Compute worked minutes via shared policy utility
+      const office = await AttendanceOfficeModel.findById(record.office_id);
+      const intervals = await AttendanceIntervalModel.findAllByRecord(record.id);
+      const workedMinutes = computeWorkedMinutes({
+        checkInAt: record.check_in_at,
+        closeTime: utc,
+        intervals,
+        toleranceMinutes: office?.outside_tolerance_minutes || 10,
+        allowanceMinutes: office?.short_outing_allowance_minutes || 30,
+      });
 
       // Update record with checkout details and coordinates
       await AttendanceRecordModel.checkout(record.id, {

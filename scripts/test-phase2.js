@@ -507,27 +507,71 @@ async function runTests() {
       record('Second check-in on the same day returns 409 Conflict', res.status === 409);
     }
 
-    // Test 18: Heartbeat GPS Jitter & Return Rules
+    // Test 18: Heartbeat GPS Jitter & Three-Way Classification Rules
     {
-      // 18a. Reading with poor accuracy outside radius does NOT mark OUTSIDE
-      // Distance ~200m, but accuracy 100m -> (200 - 100) = 100m <= radius (150m)
-      const resJitter = await api('/api/attendance/heartbeat', {
+      // 18a. Accuracy 120 with d 30 and R 150 (d + a <= R) -> stays INSIDE
+      const resInsideProven = await api('/api/attendance/heartbeat', {
         method: 'POST',
         token: tokenEmployee1,
-        body: { lat: OFFICE_LAT + 0.0018, lng: OFFICE_LNG, accuracy: 100 },
+        body: { lat: OFFICE_LAT + 0.00027, lng: OFFICE_LNG, accuracy: 120 },
       });
-      record('Heartbeat with poor accuracy outside radius stays INSIDE (jitter filter)', resJitter.body?.data?.state === 'INSIDE');
+      record('accuracy 120 with d 30 and R 150 stays INSIDE', resInsideProven.body?.data?.state === 'INSIDE');
 
-      // 18b. Definitively outside reading -> transitions to OUTSIDE
-      // Distance ~400m, accuracy 10m -> (400 - 10) = 390m > 150m
-      const resOutside = await api('/api/attendance/heartbeat', {
+      // 18b. Accuracy 5000 (weak reading) never refreshes last_inside_at and reaches UNKNOWN after 3 readings
+      const [beforeRows] = await pool.query('SELECT last_inside_at FROM attendance_presence WHERE user_id = ?', [FIXTURE_USER_1]);
+      const initialLastInsideAt = beforeRows[0]?.last_inside_at;
+
+      await api('/api/attendance/heartbeat', {
         method: 'POST',
         token: tokenEmployee1,
-        body: { lat: OFFICE_LAT + 0.004, lng: OFFICE_LNG, accuracy: 10 },
+        body: { lat: OFFICE_LAT, lng: OFFICE_LNG, accuracy: 5000 },
       });
-      record('Definitively outside heartbeat transitions to OUTSIDE', resOutside.body?.data?.state === 'OUTSIDE');
+      await api('/api/attendance/heartbeat', {
+        method: 'POST',
+        token: tokenEmployee1,
+        body: { lat: OFFICE_LAT, lng: OFFICE_LNG, accuracy: 5000 },
+      });
+      const resWeak3 = await api('/api/attendance/heartbeat', {
+        method: 'POST',
+        token: tokenEmployee1,
+        body: { lat: OFFICE_LAT, lng: OFFICE_LNG, accuracy: 5000 },
+      });
 
-      // 18c. Return rule: Returning physically inside does NOT reset state to INSIDE via heartbeat alone
+      const [afterRows] = await pool.query('SELECT last_inside_at FROM attendance_presence WHERE user_id = ?', [FIXTURE_USER_1]);
+      const afterLastInsideAt = afterRows[0]?.last_inside_at;
+
+      const unrefreshed = String(initialLastInsideAt) === String(afterLastInsideAt);
+      const reachesUnknown = resWeak3.body?.data?.state === 'UNKNOWN' && resWeak3.body?.data?.reason === 'weak_gps';
+      record('accuracy 5000 never refreshes last_inside_at and reaches UNKNOWN after 3 readings', unrefreshed && reachesUnknown);
+
+      // Re-verify to restore INSIDE before testing OUTSIDE classification
+      const chal1 = await api('/api/attendance/challenge', {
+        method: 'POST',
+        token: tokenEmployee1,
+        body: { purpose: 'reverify', lat: OFFICE_LAT, lng: OFFICE_LNG, accuracy: 15 },
+      });
+      await pool.query('UPDATE attendance_challenges SET issued_at = DATE_SUB(UTC_TIMESTAMP(), INTERVAL 5 SECOND) WHERE id = ?', [chal1.body?.data?.challengeId]);
+      await api('/api/attendance/reverify', {
+        method: 'POST',
+        token: tokenEmployee1,
+        body: {
+          challengeId: chal1.body?.data?.challengeId,
+          descriptors: [noisyCopy(faceUser1, 0.005, 1), noisyCopy(faceUser1, 0.005, 2), noisyCopy(faceUser1, 0.005, 3)],
+          lat: OFFICE_LAT,
+          lng: OFFICE_LNG,
+          accuracy: 15,
+        },
+      });
+
+      // 18c. Accuracy 100 with d 900 (d - a > R) -> becomes OUTSIDE (reason "left")
+      const resOutside900 = await api('/api/attendance/heartbeat', {
+        method: 'POST',
+        token: tokenEmployee1,
+        body: { lat: OFFICE_LAT + 0.0081, lng: OFFICE_LNG, accuracy: 100 },
+      });
+      record('accuracy 100 with d 900 becomes OUTSIDE (reason "left")', resOutside900.body?.data?.state === 'OUTSIDE' && resOutside900.body?.data?.reason === 'left');
+
+      // 18d. Return rule: Returning physically inside does NOT reset state to INSIDE via heartbeat alone
       const resReturn = await api('/api/attendance/heartbeat', {
         method: 'POST',
         token: tokenEmployee1,

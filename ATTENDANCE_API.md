@@ -233,7 +233,12 @@ Errors use HTTP status codes and provide error details:
   ```
 - **Behavior**:
   - Only allowed while an open attendance record exists for today.
-  - **GPS Jitter Protection**: Does not mark `OUTSIDE` on poor accuracy unless `(distance - accuracy) > radius_m` or after 2 consecutive outside readings (`outside_streak >= 2`).
+  - **Three-Way GPS Classification**:
+    - $a > 4 \times \text{accuracy\_max\_m}$: Weak reading. Does not refresh `last_inside_at`; increments `weak_streak`; at $\ge 3$ consecutive weak readings, transitions state to `UNKNOWN` with reason `"weak_gps"`.
+    - $d + a \le R$: Inside proven. Refreshes `last_inside_at`, resets weak and outside streaks.
+    - $d - a > R$: Outside proven. Transitions to `OUTSIDE` with reason `"left"`.
+    - $d \le R$: Probably inside. Refreshes `last_inside_at`, resets weak streak.
+    - Ambiguous outside ($d > R$ but circle overlaps): `outside_streak += 1`; at $\ge 2$ consecutive outside readings transitions to `OUTSIDE` with reason `"left"`.
   - **Return Flow**: Once `OUTSIDE`, returning physically inside does NOT change state back to `INSIDE` via heartbeat. State remains `OUTSIDE` until `/reverify` passes.
 - **Success Response (200)**:
   ```json
@@ -241,6 +246,7 @@ Errors use HTTP status codes and provide error details:
     "success": true,
     "data": {
       "state": "INSIDE",
+      "reason": null,
       "reverifyPending": false,
       "reverifyDueAt": null,
       "lastHeartbeatAt": "2026-10-03T15:35:00.000Z"

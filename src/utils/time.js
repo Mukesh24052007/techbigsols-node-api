@@ -19,7 +19,10 @@ const pad2 = (n) => String(n).padStart(2, '0');
  * @returns {string} 'YYYY-MM-DD HH:mm:ss'
  */
 function toUtcDateTime(date = new Date()) {
-  const d = date instanceof Date ? date : new Date(date);
+  if (typeof date === 'string' && /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(date)) {
+    return date;
+  }
+  const d = date instanceof Date ? date : fromUtcDateTime(date) || new Date(date);
   if (Number.isNaN(d.getTime())) {
     throw new Error('Invalid date');
   }

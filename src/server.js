@@ -1,6 +1,7 @@
 require('dotenv').config();
 const app = require('./app');
 const { testConnection, pool } = require('./config/db');
+const attendanceSweeper = require('./services/attendanceSweeper');
 
 const PORT = process.env.PORT || 3000;
 
@@ -12,9 +13,20 @@ const start = async () => {
     console.log(`   Environment: ${process.env.NODE_ENV || 'development'}`);
   });
 
+  try {
+    attendanceSweeper.start();
+  } catch (err) {
+    console.warn('⚠️  Failed to start attendance sweeper:', err.message);
+  }
+
   // Graceful shutdown — close HTTP server then DB pool
   const shutdown = async (signal) => {
     console.log(`\n${signal} received. Shutting down gracefully…`);
+    try {
+      attendanceSweeper.stop();
+    } catch (err) {
+      console.warn('⚠️  Error stopping attendance sweeper:', err.message);
+    }
     server.close(async () => {
       try {
         await pool.end();

@@ -183,7 +183,20 @@ async function loadTemplate(userId) {
   return decryptEmbedding(buf);
 }
 
-async function applyPresenceTransition({ recordId, userId, nextState, outsideStreak, at, lat, lng, accuracy }) {
+async function applyPresenceTransition({
+  recordId,
+  userId,
+  nextState,
+  reason = null,
+  outsideStreak,
+  weakStreak = 0,
+  at,
+  lat,
+  lng,
+  accuracy,
+  expectedState,
+  expectedLastHeartbeat,
+}) {
   const presence = await AttendancePresenceModel.findByRecordId(recordId);
   const utc = toUtcDateTime(at);
   let lastInsideAt = presence?.last_inside_at || null;
@@ -193,15 +206,15 @@ async function applyPresenceTransition({ recordId, userId, nextState, outsideStr
   if (nextState === 'INSIDE') {
     lastInsideAt = utc;
     outsideSince = null;
-  } else if (nextState === 'OUTSIDE') {
-    if (presence?.state !== 'OUTSIDE' || !outsideSince) {
+  } else if (nextState === 'OUTSIDE' || nextState === 'UNKNOWN') {
+    if ((presence?.state !== 'OUTSIDE' && presence?.state !== 'UNKNOWN') || !outsideSince) {
       outsideSince = utc;
     }
   }
 
   if (!presence) {
     await AttendancePresenceModel.create(null, {
-      recordId, userId, state: nextState, outsideStreak: streak, at: utc, lat, lng, accuracy,
+      recordId, userId, state: nextState, reason, outsideStreak: streak, weakStreak, at: utc, lat, lng, accuracy,
     });
     await AttendanceIntervalModel.open(null, { recordId, state: nextState, startedAt: utc });
     return { state: nextState, lastInsideAt, outsideSince };
@@ -212,10 +225,14 @@ async function applyPresenceTransition({ recordId, userId, nextState, outsideStr
     await AttendanceIntervalModel.open(null, { recordId, state: nextState, startedAt: utc });
   }
 
-  await AttendancePresenceModel.updateHeartbeat({
+  const updated = await AttendancePresenceModel.updateConditional({
     recordId,
+    expectedState: expectedState !== undefined ? expectedState : undefined,
+    expectedLastHeartbeat: expectedLastHeartbeat !== undefined ? expectedLastHeartbeat : undefined,
     state: nextState,
+    reason,
     outsideStreak: streak,
+    weakStreak,
     at: utc,
     lat,
     lng,
@@ -224,7 +241,7 @@ async function applyPresenceTransition({ recordId, userId, nextState, outsideStr
     outsideSince,
   });
 
-  return { state: nextState, lastInsideAt, outsideSince };
+  return { success: updated, state: nextState, lastInsideAt, outsideSince };
 }
 
 async function createCheckInRecord({ user, office, profile, lat, lng, accuracy, ip }) {
