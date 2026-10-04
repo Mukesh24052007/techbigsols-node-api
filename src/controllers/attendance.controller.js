@@ -9,7 +9,7 @@ const {
   parseMonth,
   parseIsoDate,
 } = require('../utils/attendanceValidate');
-const { haversineDistance } = require('../utils/geo');
+const { haversineMetres } = require('../utils/geo');
 const { encryptEmbedding } = require('../utils/crypto');
 const {
   euclideanDistance,
@@ -269,7 +269,7 @@ const AttendanceController = {
         throw httpError(400, 'Assigned office was not found.');
       }
 
-      const dist = haversineDistance({ lat, lng }, { lat: office.lat, lng: office.lng });
+      const dist = haversineMetres(Number(lat), Number(lng), Number(office.lat), Number(office.lng));
       const presence = await AttendancePresenceModel.findByRecordId(record.id);
 
       const isReadingOutside = dist > office.radius_m;

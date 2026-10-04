@@ -97,7 +97,11 @@ function requireConsent(profile, what) {
 }
 
 function assertLocation(office, lat, lng, accuracy, ip) {
-  return evaluateLocation({ office, lat, lng, accuracy, ip });
+  const result = evaluateLocation({ office, lat, lng, accuracy, ip });
+  if (!result.ok) {
+    throw httpError(400, result.reason || 'Location check failed.');
+  }
+  return result;
 }
 
 async function createChallenge({ userId, purpose, issuedAt = new Date() }) {

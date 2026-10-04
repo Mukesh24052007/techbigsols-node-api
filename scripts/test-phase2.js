@@ -20,6 +20,7 @@ const bcrypt = require('bcryptjs');
 const app = require('../src/app');
 const { pool } = require('../src/config/db');
 const { toUtcDateTime, istCalendarDate } = require('../src/utils/time');
+const { recordAttempt } = require('../src/services/attendanceGate');
 
 // ── Environment Guard ────────────────────────────────────────────────────────
 const dbHost = process.env.DB_HOST || 'localhost';
@@ -150,8 +151,9 @@ async function runTests() {
     );
 
     // Issue JWTs
-    const tokenEmployee1 = jwt.sign({ type: 'site_user', user_id: FIXTURE_USER_1 }, JWT_SECRET, { expiresIn: '1h' });
-    const tokenEmployee2 = jwt.sign({ type: 'site_user', user_id: FIXTURE_USER_2 }, JWT_SECRET, { expiresIn: '1h' });
+    const makeEmployeeToken = (id) => jwt.sign({ userId: id, type: 'site_user' }, JWT_SECRET, { expiresIn: '1h' });
+    const tokenEmployee1 = makeEmployeeToken(FIXTURE_USER_1);
+    const tokenEmployee2 = makeEmployeeToken(FIXTURE_USER_2);
     const tokenAdmin = jwt.sign({ id: FIXTURE_ADMIN_ID, role: 'admin' }, JWT_SECRET, { expiresIn: '1h' });
 
     // Descriptors setup
@@ -221,7 +223,7 @@ async function runTests() {
       // Also set consent for User 3
       await api('/api/attendance/me/consent', {
         method: 'POST',
-        token: jwt.sign({ type: 'site_user', user_id: FIXTURE_USER_OTHER }, JWT_SECRET, { expiresIn: '1h' }),
+        token: makeEmployeeToken(FIXTURE_USER_OTHER),
         body: { version: '1.0' },
       });
     }
@@ -384,6 +386,7 @@ async function runTests() {
     }
 
     // Test 14: Another person's face -> 400
+    await pool.query('DELETE FROM attendance_attempts WHERE user_id = ?', [FIXTURE_USER_1]);
     {
       const chalRes = await api('/api/attendance/challenge', {
         method: 'POST',
@@ -419,6 +422,9 @@ async function runTests() {
     }
 
     // Test 15: Valid check-in inside radius with genuine face -> 200
+    // Reset any failure count for User 1 before testing normal check-in flow
+    await pool.query('DELETE FROM attendance_attempts WHERE user_id = ?', [FIXTURE_USER_1]);
+
     let checkinChallengeId = null;
     {
       const chalRes = await api('/api/attendance/challenge', {
@@ -583,19 +589,20 @@ async function runTests() {
 
     // Test 22: Rate limiting lock after 5 failures -> 429
     {
-      // Create 5 failed attempts in the last 2 minutes for User 3
-      const recent = toUtcDateTime(new Date(Date.now() - 30 * 1000));
+      // Log 5 failed attempts for User 3 to trigger rate limiting lockout
       for (let i = 0; i < 5; i++) {
-        await pool.query(
-          `INSERT INTO attendance_attempts
-            (user_id, kind, success, reason, created_at)
-           VALUES (?, 'checkin', 0, 'test_failure', ?)`,
-          [FIXTURE_USER_OTHER, recent]
-        );
+        await recordAttempt({
+          userId: FIXTURE_USER_OTHER,
+          kind: 'checkin',
+          success: false,
+          accuracy: 15,
+          ip: '127.0.0.1',
+          reason: 'test_failure',
+        });
       }
 
       // 6th attempt should trigger 429 lock
-      const user3Token = jwt.sign({ type: 'site_user', user_id: FIXTURE_USER_OTHER }, JWT_SECRET, { expiresIn: '1h' });
+      const user3Token = makeEmployeeToken(FIXTURE_USER_OTHER);
       const res = await api('/api/attendance/challenge', {
         method: 'POST',
         token: user3Token,
