@@ -39,83 +39,88 @@ const AttendancePresenceModel = {
     expectedState,
     expectedLastHeartbeat,
     state,
-    reason = null,
-    outsideStreak = 0,
-    weakStreak = 0,
+    reason,
+    outsideStreak,
+    weakStreak,
     at,
-    lat = null,
-    lng = null,
-    accuracy = null,
+    lat,
+    lng,
+    accuracy,
     lastInsideAt,
     outsideSince,
     leftAlertedAt,
   }) {
-    const now = toUtcDateTime();
+    const setClauses = ['updated_at = UTC_TIMESTAMP()'];
+    const params = [];
+
+    if (state !== undefined) {
+      setClauses.push('state = ?');
+      params.push(state);
+    }
+    if (reason !== undefined) {
+      setClauses.push('reason = ?');
+      params.push(reason);
+    }
+    if (outsideStreak !== undefined) {
+      setClauses.push('outside_streak = ?');
+      params.push(outsideStreak);
+    }
+    if (weakStreak !== undefined) {
+      setClauses.push('weak_streak = ?');
+      params.push(weakStreak);
+    }
+    if (at !== undefined) {
+      setClauses.push('last_heartbeat_at = ?');
+      params.push(at);
+    }
+    if (lastInsideAt !== undefined) {
+      setClauses.push('last_inside_at = ?');
+      params.push(lastInsideAt);
+    }
+    if (outsideSince !== undefined) {
+      setClauses.push('outside_since = ?');
+      params.push(outsideSince);
+    }
+    if (leftAlertedAt !== undefined) {
+      setClauses.push('left_alerted_at = ?');
+      params.push(leftAlertedAt);
+    }
+    if (lat !== undefined) {
+      setClauses.push('last_lat = ?');
+      params.push(lat);
+    }
+    if (lng !== undefined) {
+      setClauses.push('last_lng = ?');
+      params.push(lng);
+    }
+    if (accuracy !== undefined) {
+      setClauses.push('last_accuracy = ?');
+      params.push(accuracy);
+    }
+
     let whereClause = 'WHERE record_id = ?';
-    const params = [
-      state,
-      reason,
-      outsideStreak,
-      weakStreak,
-      at !== undefined ? at : null,
-      lastInsideAt !== undefined ? lastInsideAt : null,
-      outsideSince !== undefined ? outsideSince : null,
-      lat !== undefined ? lat : null,
-      lng !== undefined ? lng : null,
-      accuracy !== undefined ? accuracy : null,
-      leftAlertedAt !== undefined ? leftAlertedAt : null,
-      now,
-      recordId,
-    ];
+    const whereParams = [recordId];
 
     if (expectedState !== undefined && expectedState !== null) {
       whereClause += ' AND state = ?';
-      params.push(expectedState);
+      whereParams.push(expectedState);
     }
     if (expectedLastHeartbeat !== undefined) {
       if (expectedLastHeartbeat === null) {
         whereClause += ' AND last_heartbeat_at IS NULL';
       } else {
         whereClause += ' AND last_heartbeat_at = ?';
-        params.push(expectedLastHeartbeat);
+        whereParams.push(expectedLastHeartbeat);
       }
     }
 
     const sql = `
       UPDATE attendance_presence
-      SET state = ?,
-          reason = ?,
-          outside_streak = ?,
-          weak_streak = ?,
-          last_heartbeat_at = CASE WHEN ? IS NOT NULL THEN ? ELSE last_heartbeat_at END,
-          last_inside_at = ?,
-          outside_since = ?,
-          last_lat = CASE WHEN ? IS NOT NULL THEN ? ELSE last_lat END,
-          last_lng = CASE WHEN ? IS NOT NULL THEN ? ELSE last_lng END,
-          last_accuracy = CASE WHEN ? IS NOT NULL THEN ? ELSE last_accuracy END,
-          left_alerted_at = ?,
-          updated_at = ?
+      SET ${setClauses.join(', ')}
       ${whereClause}
     `;
 
-    // Duplicate positional params for CASE WHEN conditions
-    const finalParams = [
-      params[0], // state
-      params[1], // reason
-      params[2], // outsideStreak
-      params[3], // weakStreak
-      params[4], params[4], // at
-      params[5], // lastInsideAt
-      params[6], // outsideSince
-      params[7], params[7], // lat
-      params[8], params[8], // lng
-      params[9], params[9], // accuracy
-      params[10], // leftAlertedAt
-      params[11], // updated_at
-      ...params.slice(12), // where params
-    ];
-
-    const [result] = await pool.query(sql, finalParams);
+    const [result] = await pool.query(sql, [...params, ...whereParams]);
     return result.affectedRows > 0;
   },
 

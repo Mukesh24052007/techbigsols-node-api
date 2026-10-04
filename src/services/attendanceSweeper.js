@@ -186,23 +186,34 @@ async function performSweep(now = new Date()) {
     for (const task of tasks) {
       const dueDate = fromUtcDateTime(task.due_at);
       if (task.status === 'PENDING' && dueDate && now.getTime() > dueDate.getTime()) {
-        const missed = await AttendanceReverifyModel.markMissed(task.id);
-        if (missed) {
-          await recordAttempt({
-            userId: record.user_id,
-            kind: 'violation',
-            success: false,
-            reason: 'reverify_missed',
-            attemptedAt: nowUtc,
-          }).catch(() => {});
+        const heartbeatIntervalSec = record.heartbeat_seconds != null ? record.heartbeat_seconds : 60;
+        const freshThresholdMs = 2 * heartbeatIntervalSec * 1000;
+        const refTime = presence?.last_heartbeat_at || record.check_in_at;
+        const refDate = fromUtcDateTime(refTime);
+        const isHeartbeatFresh = refDate && (now.getTime() - refDate.getTime() <= freshThresholdMs);
 
-          attendanceBus.emit('violation', {
-            employeeId: record.user_id,
-            name: record.fullname,
-            time: nowUtc,
-            reason: 'reverify_missed',
-          });
-          reverifyViolations++;
+        if (presence?.state === 'INSIDE' && isHeartbeatFresh) {
+          const missed = await AttendanceReverifyModel.markMissed(task.id);
+          if (missed) {
+            await recordAttempt({
+              userId: record.user_id,
+              kind: 'violation',
+              success: false,
+              reason: 'reverify_missed',
+              attemptedAt: nowUtc,
+            }).catch(() => {});
+
+            attendanceBus.emit('violation', {
+              employeeId: record.user_id,
+              name: record.fullname,
+              time: nowUtc,
+              reason: 'reverify_missed',
+            });
+            reverifyViolations++;
+          }
+        } else {
+          // Task due window passed while presence was UNKNOWN or OUTSIDE -> SKIPPED (no violation)
+          await AttendanceReverifyModel.markSkipped(task.id);
         }
       }
     }

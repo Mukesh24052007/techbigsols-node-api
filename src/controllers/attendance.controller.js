@@ -310,6 +310,11 @@ const AttendanceController = {
           nextState = 'OUTSIDE';
           nextReason = 'left';
           shouldRefreshLastInside = false;
+        } else if (presence.state === 'UNKNOWN' && presence.left_alerted_at) {
+          // UNKNOWN beyond tolerance: requires /reverify like the OUTSIDE case
+          nextState = 'UNKNOWN';
+          nextReason = presence.reason;
+          shouldRefreshLastInside = false;
         } else {
           nextState = 'INSIDE';
           nextReason = null;
@@ -327,6 +332,11 @@ const AttendanceController = {
         if (presence.state === 'OUTSIDE') {
           nextState = 'OUTSIDE';
           nextReason = 'left';
+          shouldRefreshLastInside = false;
+        } else if (presence.state === 'UNKNOWN' && presence.left_alerted_at) {
+          nextState = 'UNKNOWN';
+          nextReason = presence.reason;
+          shouldRefreshLastInside = false;
         } else {
           nextState = 'INSIDE';
           nextReason = null;

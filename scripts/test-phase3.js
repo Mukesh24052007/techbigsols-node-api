@@ -1,6 +1,9 @@
 'use strict';
 
 require('dotenv').config();
+const http = require('http');
+const jwt = require('jsonwebtoken');
+const app = require('../src/app');
 const { pool } = require('../src/config/db');
 const { computeWorkedMinutes } = require('../src/utils/workedMinutes');
 const attendanceBus = require('../src/services/attendanceBus');
@@ -9,6 +12,9 @@ const AttendancePresenceModel = require('../src/models/attendancePresence.model'
 const AttendanceIntervalModel = require('../src/models/attendanceInterval.model');
 const AttendanceRecordModel = require('../src/models/attendanceRecord.model');
 const AttendanceReverifyModel = require('../src/models/attendanceReverify.model');
+const AttendanceOfficeModel = require('../src/models/attendanceOffice.model');
+const AttendanceProfileModel = require('../src/models/attendanceProfile.model');
+const { createCheckInRecord } = require('../src/services/attendanceGate');
 const { toUtcDateTime, fromUtcDateTime, sqlUtc, istCalendarDate, istDateTimeToUtc } = require('../src/utils/time');
 const { haversineMetres } = require('../src/utils/geo');
 
@@ -21,6 +27,31 @@ if (dbHost !== 'localhost' && dbHost !== '127.0.0.1') {
 if (process.env.NODE_ENV === 'production') {
   console.error('Refusing to run tests in production NODE_ENV.');
   process.exit(1);
+}
+
+const JWT_SECRET = process.env.JWT_SECRET || 'test_secret';
+
+let server = null;
+let baseUrl = '';
+
+async function api(path, { method = 'GET', token = null, body = null } = {}) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+
+  const res = await fetch(`${baseUrl}${path}`, {
+    method,
+    headers,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+
+  const text = await res.text();
+  let json = null;
+  try {
+    json = JSON.parse(text);
+  } catch (e) {
+    json = { raw: text };
+  }
+  return { status: res.status, headers: res.headers, body: json };
 }
 
 const results = [];
@@ -43,6 +74,11 @@ const OFFICE_LNG = 77.594566;
 
 async function run() {
   console.log('🧪 Starting Phase 3 Presence Engine & Sweeper Tests...\n');
+
+  server = http.createServer(app);
+  await new Promise((resolve) => server.listen(0, resolve));
+  const port = server.address().port;
+  baseUrl = `http://127.0.0.1:${port}`;
 
   // ── PART 1: Unit Tests for workedMinutes.js ───────────────────────────────
   console.log('--- Unit Tests: computeWorkedMinutes ---');
@@ -138,11 +174,26 @@ async function run() {
     busEvents.push(evt);
   });
 
+  async function cleanAllFixtures() {
+    const users = [FIXTURE_USER_1, FIXTURE_USER_2, FIXTURE_USER_3, FIXTURE_USER_4];
+    const [records] = await pool.query('SELECT id FROM attendance_records WHERE user_id IN (?, ?, ?, ?)', users);
+    const recIds = records.map((r) => r.id);
+    if (recIds.length > 0) {
+      await pool.query(`DELETE FROM attendance_intervals WHERE record_id IN (${recIds.map(() => '?').join(',')})`, recIds);
+      await pool.query(`DELETE FROM attendance_presence WHERE record_id IN (${recIds.map(() => '?').join(',')})`, recIds);
+      await pool.query(`DELETE FROM attendance_reverify_tasks WHERE record_id IN (${recIds.map(() => '?').join(',')})`, recIds);
+      await pool.query(`DELETE FROM attendance_records WHERE id IN (${recIds.map(() => '?').join(',')})`, recIds);
+    }
+    await pool.query('DELETE FROM attendance_attempts WHERE user_id IN (?, ?, ?, ?)', users);
+    await pool.query('DELETE FROM attendance_challenges WHERE user_id IN (?, ?, ?, ?)', users);
+    await pool.query('DELETE FROM attendance_profiles WHERE user_id IN (?, ?, ?, ?)', users);
+    await pool.query('DELETE FROM site_users WHERE user_id IN (?, ?, ?, ?)', users);
+    await pool.query('DELETE FROM attendance_offices WHERE name = ?', [FIXTURE_OFFICE_NAME]);
+  }
+
   try {
     // Clean any residual test fixtures
-    await pool.query('DELETE FROM attendance_profiles WHERE user_id IN (?, ?, ?, ?)', [FIXTURE_USER_1, FIXTURE_USER_2, FIXTURE_USER_3, FIXTURE_USER_4]);
-    await pool.query('DELETE FROM site_users WHERE user_id IN (?, ?, ?, ?)', [FIXTURE_USER_1, FIXTURE_USER_2, FIXTURE_USER_3, FIXTURE_USER_4]);
-    await pool.query('DELETE FROM attendance_offices WHERE name = ?', [FIXTURE_OFFICE_NAME]);
+    await cleanAllFixtures();
 
     // Create test office with:
     // heartbeat_seconds = 30 (no-signal threshold = 60s)
@@ -313,7 +364,7 @@ async function run() {
       await pool.query('DELETE FROM attendance_records WHERE id = ?', [recordId]);
     }
 
-    // 9. Test Re-verify task scheduled, then missed, then violation row
+    // 9. Test Re-verify task scheduled, then missed with fresh heartbeat
     {
       const checkInTime = new Date('2026-10-04T09:30:00Z');
       const [recRes] = await pool.query(
@@ -345,10 +396,16 @@ async function run() {
       const scheduled = tasks.length > 0 && tasks[0].status === 'PENDING';
       record('sweeper: reverify task scheduled when fewer than N exist', scheduled);
 
-      // Now simulate task expiration: advance time past due_at (which is scheduled_at + 5 min)
+      // Advance time past due_at (which is scheduled_at + 5 min)
       if (tasks.length > 0) {
         const dueTime = fromUtcDateTime(tasks[0].due_at);
-        const expiredNow = new Date(dueTime.getTime() + 60000); // 1 minute after due_at
+        const expiredNow = new Date(dueTime.getTime() + 10000); // 10s after due_at
+        // Refresh heartbeat to 10s before expiredNow so it is fresh (within 2 * 30 = 60s)
+        await AttendancePresenceModel.updateConditional({
+          recordId,
+          state: 'INSIDE',
+          at: toUtcDateTime(new Date(expiredNow.getTime() - 10000)),
+        });
 
         busEvents.length = 0;
         await attendanceSweeper.sweepOnce(expiredNow);
@@ -363,8 +420,63 @@ async function run() {
         const hasViolationAttempt = attemptRows[0]?.reason === 'reverify_missed';
         const violationEvent = busEvents.find((e) => e.type === 'violation' && e.employeeId === FIXTURE_USER_1);
 
-        record('sweeper: expired reverify task marked MISSED with violation row and event', isMissed && hasViolationAttempt && Boolean(violationEvent));
+        record('sweeper: expired reverify task while INSIDE with fresh heartbeat marked MISSED with violation row and event', isMissed && hasViolationAttempt && Boolean(violationEvent));
       }
+
+      await pool.query('DELETE FROM attendance_reverify_tasks WHERE record_id = ?', [recordId]);
+      await pool.query('DELETE FROM attendance_attempts WHERE user_id = ?', [FIXTURE_USER_1]);
+      await pool.query('DELETE FROM attendance_presence WHERE record_id = ?', [recordId]);
+      await pool.query('DELETE FROM attendance_records WHERE id = ?', [recordId]);
+    }
+
+    // 9b. Pass 2b: Reverify task expiring while UNKNOWN or OUTSIDE becomes SKIPPED (no violation)
+    {
+      const checkInTime = new Date('2026-10-04T09:30:00Z');
+      const [recRes] = await pool.query(
+        `INSERT INTO attendance_records
+          (user_id, attendance_date, fullname, office_id, check_in_at, status, worked_minutes, created_at, updated_at)
+         VALUES (?, '2026-10-04', 'Phase3 User 1', ?, ?, 'PRESENT', 0, ?, ?)`,
+        [FIXTURE_USER_1, testOfficeId, toUtcDateTime(checkInTime), toUtcDateTime(checkInTime), toUtcDateTime(checkInTime)]
+      );
+      const recordId = recRes.insertId;
+
+      await AttendancePresenceModel.create(null, {
+        recordId,
+        userId: FIXTURE_USER_1,
+        state: 'UNKNOWN',
+        reason: 'no_signal',
+        outsideStreak: 0,
+        weakStreak: 0,
+        at: toUtcDateTime(checkInTime),
+        lat: OFFICE_LAT,
+        lng: OFFICE_LNG,
+        accuracy: 10,
+      });
+
+      // Insert a pending task due 10 seconds ago
+      const dueAtUtc = toUtcDateTime(new Date('2026-10-04T10:00:00Z'));
+      await AttendanceReverifyModel.schedule({
+        recordId,
+        userId: FIXTURE_USER_1,
+        scheduledAt: toUtcDateTime(new Date('2026-10-04T09:55:00Z')),
+        dueAt: dueAtUtc,
+      });
+
+      const sweepNow = new Date('2026-10-04T10:01:00Z');
+      busEvents.length = 0;
+      await attendanceSweeper.sweepOnce(sweepNow);
+
+      const tasks = await AttendanceReverifyModel.findByRecord(recordId);
+      const isSkipped = tasks[0]?.status === 'SKIPPED';
+
+      const [attemptRows] = await pool.query(
+        `SELECT kind, reason FROM attendance_attempts WHERE user_id = ? AND kind = 'violation' AND reason = 'reverify_missed'`,
+        [FIXTURE_USER_1]
+      );
+      const noViolationAttempt = attemptRows.length === 0;
+      const noViolationEvent = !busEvents.find((e) => e.type === 'violation' && e.employeeId === FIXTURE_USER_1);
+
+      record('Pass 2b: reverify task due while UNKNOWN/OUTSIDE becomes SKIPPED with no violation', isSkipped && noViolationAttempt && noViolationEvent);
 
       await pool.query('DELETE FROM attendance_reverify_tasks WHERE record_id = ?', [recordId]);
       await pool.query('DELETE FROM attendance_attempts WHERE user_id = ?', [FIXTURE_USER_1]);
@@ -553,13 +665,218 @@ async function run() {
       await pool.query('DELETE FROM attendance_records WHERE id = ?', [recordId]);
     }
 
+    // 14. Pass 2a: Proven-inside heartbeat while UNKNOWN
+    {
+      const checkInUtc = '2026-10-04 10:00:00';
+      const userToken = jwt.sign({ userId: FIXTURE_USER_1, type: 'site_user' }, JWT_SECRET, { expiresIn: '1h' });
+
+      // Case 1: left_alerted_at is NULL (under tolerance) -> restores INSIDE, closes UNKNOWN interval
+      const [recRes1] = await pool.query(
+        `INSERT INTO attendance_records
+          (user_id, attendance_date, fullname, office_id, check_in_at, status, worked_minutes, created_at, updated_at)
+         VALUES (?, '2026-10-04', 'Phase3 User 1', ?, ?, 'PRESENT', 0, ?, ?)`,
+        [FIXTURE_USER_1, testOfficeId, checkInUtc, checkInUtc, checkInUtc]
+      );
+      const recordId1 = recRes1.insertId;
+
+      await AttendancePresenceModel.create(null, {
+        recordId: recordId1,
+        userId: FIXTURE_USER_1,
+        state: 'UNKNOWN',
+        reason: 'no_signal',
+        outsideStreak: 0,
+        weakStreak: 0,
+        at: checkInUtc,
+        lat: OFFICE_LAT,
+        lng: OFFICE_LNG,
+        accuracy: 10,
+      });
+      // left_alerted_at is NULL
+      await AttendanceIntervalModel.open(null, { recordId: recordId1, state: 'UNKNOWN', startedAt: checkInUtc });
+
+      // Send good heartbeat via API
+      const hbRes1 = await api('/api/attendance/heartbeat', {
+        method: 'POST',
+        token: userToken,
+        body: { lat: OFFICE_LAT, lng: OFFICE_LNG, accuracy: 10 },
+      });
+
+      const pres1 = await AttendancePresenceModel.findByRecordId(recordId1);
+      const intervals1 = await AttendanceIntervalModel.findAllByRecord(recordId1);
+      const unkInterval1 = intervals1.find((i) => i.state === 'UNKNOWN');
+      const insideInterval1 = intervals1.find((i) => i.state === 'INSIDE');
+
+      const restoredInside = hbRes1.status === 200 && hbRes1.body?.data?.state === 'INSIDE' && pres1.state === 'INSIDE';
+      const intervalClosed = unkInterval1?.ended_at != null && insideInterval1?.ended_at == null;
+
+      record('Pass 2a: heartbeat while UNKNOWN with left_alerted_at NULL restores INSIDE and closes interval', restoredInside && intervalClosed);
+
+      await pool.query('DELETE FROM attendance_intervals WHERE record_id = ?', [recordId1]);
+      await pool.query('DELETE FROM attendance_presence WHERE record_id = ?', [recordId1]);
+      await pool.query('DELETE FROM attendance_records WHERE id = ?', [recordId1]);
+
+      // Case 2: left_alerted_at is SET (over tolerance) -> stays UNKNOWN, requires /reverify
+      const [recRes2] = await pool.query(
+        `INSERT INTO attendance_records
+          (user_id, attendance_date, fullname, office_id, check_in_at, status, worked_minutes, created_at, updated_at)
+         VALUES (?, '2026-10-04', 'Phase3 User 1', ?, ?, 'PRESENT', 0, ?, ?)`,
+        [FIXTURE_USER_1, testOfficeId, checkInUtc, checkInUtc, checkInUtc]
+      );
+      const recordId2 = recRes2.insertId;
+
+      await AttendancePresenceModel.create(null, {
+        recordId: recordId2,
+        userId: FIXTURE_USER_1,
+        state: 'UNKNOWN',
+        reason: 'no_signal',
+        outsideStreak: 0,
+        weakStreak: 0,
+        at: checkInUtc,
+        lat: OFFICE_LAT,
+        lng: OFFICE_LNG,
+        accuracy: 10,
+      });
+      await AttendancePresenceModel.updateConditional({
+        recordId: recordId2,
+        leftAlertedAt: '2026-10-04 10:06:00',
+      });
+      await AttendanceIntervalModel.open(null, { recordId: recordId2, state: 'UNKNOWN', startedAt: checkInUtc });
+
+      const hbRes2 = await api('/api/attendance/heartbeat', {
+        method: 'POST',
+        token: userToken,
+        body: { lat: OFFICE_LAT, lng: OFFICE_LNG, accuracy: 10 },
+      });
+
+      const pres2 = await AttendancePresenceModel.findByRecordId(recordId2);
+      const stayedUnknown = hbRes2.status === 200 && hbRes2.body?.data?.state === 'UNKNOWN' && pres2.state === 'UNKNOWN';
+
+      record('Pass 2a: heartbeat while UNKNOWN with left_alerted_at set requires reverify (stays UNKNOWN)', stayedUnknown);
+
+      await pool.query('DELETE FROM attendance_intervals WHERE record_id = ?', [recordId2]);
+      await pool.query('DELETE FROM attendance_presence WHERE record_id = ?', [recordId2]);
+      await pool.query('DELETE FROM attendance_records WHERE id = ?', [recordId2]);
+    }
+
+    // 15. Pass 1: Timezone matrix round-trip check-in test
+    {
+      const user = { user_id: FIXTURE_USER_1, fullname: 'Phase3 User 1' };
+      const office = await AttendanceOfficeModel.findById(testOfficeId);
+      const profile = await AttendanceProfileModel.findByUserId(FIXTURE_USER_1);
+      const userToken = jwt.sign({ userId: FIXTURE_USER_1, type: 'site_user' }, JWT_SECRET, { expiresIn: '1h' });
+
+      // Sub-case A: Check-in at 23:50 IST (18:20 UTC)
+      // IST calendar date is 2026-10-04
+      const time2350 = new Date('2026-10-04T18:20:00.000Z');
+      const rec2350 = await createCheckInRecord({
+        user,
+        office,
+        profile,
+        at: time2350,
+        lat: OFFICE_LAT,
+        lng: OFFICE_LNG,
+        accuracy: 10,
+        ip: '127.0.0.1',
+      });
+
+      // Raw DB query
+      const [rawRows1] = await pool.query(
+        `SELECT id, DATE_FORMAT(attendance_date, '%Y-%m-%d') AS attendance_date, ${sqlUtc('check_in_at')}
+         FROM attendance_records WHERE id = ?`,
+        [rec2350.recordId]
+      );
+      const raw1 = rawRows1[0];
+      const rawDate1 = raw1?.attendance_date;
+      const rawCheckInInstant1 = fromUtcDateTime(raw1?.check_in_at)?.getTime();
+
+      const pass2350 = rawDate1 === '2026-10-04' && rawCheckInInstant1 === time2350.getTime();
+      record('Pass 1: check-in at 23:50 IST round-trips same instant and IST date 2026-10-04', pass2350, `date: ${rawDate1}, diff: ${rawCheckInInstant1 - time2350.getTime()}ms`);
+
+      // Cleanup
+      await pool.query('DELETE FROM attendance_intervals WHERE record_id = ?', [rec2350.recordId]);
+      await pool.query('DELETE FROM attendance_presence WHERE record_id = ?', [rec2350.recordId]);
+      await pool.query('DELETE FROM attendance_records WHERE id = ?', [rec2350.recordId]);
+
+      // Sub-case B: Check-in at 00:10 IST next day (18:40 UTC on 2026-10-04)
+      // IST calendar date is 2026-10-05
+      const time0010 = new Date('2026-10-04T18:40:00.000Z');
+      const rec0010 = await createCheckInRecord({
+        user,
+        office,
+        profile,
+        at: time0010,
+        lat: OFFICE_LAT,
+        lng: OFFICE_LNG,
+        accuracy: 10,
+        ip: '127.0.0.1',
+      });
+
+      const [rawRows2] = await pool.query(
+        `SELECT id, DATE_FORMAT(attendance_date, '%Y-%m-%d') AS attendance_date, ${sqlUtc('check_in_at')}
+         FROM attendance_records WHERE id = ?`,
+        [rec0010.recordId]
+      );
+      const raw2 = rawRows2[0];
+      const rawDate2 = raw2?.attendance_date;
+      const rawCheckInInstant2 = fromUtcDateTime(raw2?.check_in_at)?.getTime();
+
+      const pass0010 = rawDate2 === '2026-10-05' && rawCheckInInstant2 === time0010.getTime();
+      record('Pass 1: check-in at 00:10 IST round-trips same instant and IST date 2026-10-05', pass0010, `date: ${rawDate2}, diff: ${rawCheckInInstant2 - time0010.getTime()}ms`);
+
+      await pool.query('DELETE FROM attendance_intervals WHERE record_id = ?', [rec0010.recordId]);
+      await pool.query('DELETE FROM attendance_presence WHERE record_id = ?', [rec0010.recordId]);
+      await pool.query('DELETE FROM attendance_records WHERE id = ?', [rec0010.recordId]);
+
+      // Sub-case C: Check-in now via real check-in path, read back through API (me/status) and raw DB query
+      const nowInstant = new Date();
+      const recNow = await createCheckInRecord({
+        user,
+        office,
+        profile,
+        at: nowInstant,
+        lat: OFFICE_LAT,
+        lng: OFFICE_LNG,
+        accuracy: 10,
+        ip: '127.0.0.1',
+      });
+
+      const apiStatusRes = await api('/api/attendance/me/status', {
+        method: 'GET',
+        token: userToken,
+      });
+
+      const [rawRowsNow] = await pool.query(
+        `SELECT id, DATE_FORMAT(attendance_date, '%Y-%m-%d') AS attendance_date, ${sqlUtc('check_in_at')}
+         FROM attendance_records WHERE id = ?`,
+        [recNow.recordId]
+      );
+      const rawNow = rawRowsNow[0];
+      const apiCheckInAt = apiStatusRes.body?.data?.todayRecord?.check_in_at;
+      const apiCheckInInstant = fromUtcDateTime(apiCheckInAt)?.getTime();
+      const rawNowInstant = fromUtcDateTime(rawNow?.check_in_at)?.getTime();
+
+      // Check to nearest second
+      const instantDiff = Math.abs(apiCheckInInstant - Math.floor(nowInstant.getTime() / 1000) * 1000);
+      const apiMatchesRaw = apiCheckInInstant === rawNowInstant;
+      const apiMatchesIstDate = apiStatusRes.body?.data?.todayRecord?.attendance_date === istCalendarDate(nowInstant);
+
+      record('Pass 1: real check-in read back through API and raw DB query round-trips same instant in current TZ', apiMatchesRaw && apiMatchesIstDate && instantDiff <= 1000, `api: ${apiCheckInAt}, raw: ${rawNow?.check_in_at}`);
+
+      await pool.query('DELETE FROM attendance_intervals WHERE record_id = ?', [recNow.recordId]);
+      await pool.query('DELETE FROM attendance_presence WHERE record_id = ?', [recNow.recordId]);
+      await pool.query('DELETE FROM attendance_records WHERE id = ?', [recNow.recordId]);
+    }
+
   } finally {
     unsubscribeBus();
+    if (server) {
+      await new Promise((resolve) => server.close(resolve));
+    }
     console.log('\n🧹 Cleaning up Phase 3 fixtures...');
-    await pool.query('DELETE FROM attendance_profiles WHERE user_id IN (?, ?, ?, ?)', [FIXTURE_USER_1, FIXTURE_USER_2, FIXTURE_USER_3, FIXTURE_USER_4]);
-    await pool.query('DELETE FROM site_users WHERE user_id IN (?, ?, ?, ?)', [FIXTURE_USER_1, FIXTURE_USER_2, FIXTURE_USER_3, FIXTURE_USER_4]);
-    if (testOfficeId) {
-      await pool.query('DELETE FROM attendance_offices WHERE id = ?', [testOfficeId]);
+    try {
+      await cleanAllFixtures();
+    } catch (err) {
+      console.warn('⚠️ Error cleaning up fixtures:', err.message);
     }
     console.log('✅ Fixtures cleaned up cleanly.\n');
   }

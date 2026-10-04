@@ -36,6 +36,16 @@ const AttendanceReverifyModel = {
     return result.affectedRows > 0;
   },
 
+  async markSkipped(id) {
+    const [result] = await pool.query(
+      `UPDATE attendance_reverify_tasks
+       SET status = 'SKIPPED'
+       WHERE id = ? AND status = 'PENDING'`,
+      [id]
+    );
+    return result.affectedRows > 0;
+  },
+
   async schedule({ recordId, userId, scheduledAt, dueAt }) {
     const [result] = await pool.query(
       `INSERT INTO attendance_reverify_tasks

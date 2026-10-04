@@ -351,7 +351,7 @@ const migrate = async () => {
             scheduled_at  DATETIME     NOT NULL,
             due_at        DATETIME     NOT NULL,
             completed_at  DATETIME     DEFAULT NULL,
-            status        ENUM('PENDING','COMPLETED','MISSED','CANCELLED') NOT NULL DEFAULT 'PENDING',
+            status        ENUM('PENDING','COMPLETED','MISSED','SKIPPED','CANCELLED') NOT NULL DEFAULT 'PENDING',
             INDEX idx_att_reverify_record (record_id),
             INDEX idx_att_reverify_due (status, due_at),
             INDEX idx_att_reverify_user (user_id, scheduled_at)
@@ -480,6 +480,15 @@ const migrate = async () => {
       }
     } catch (err) {
       console.warn('⚠️  attendance_offices: could not add short_outing_allowance_minutes —', err.message);
+    }
+
+    // ── Guarded upgrade: ensure attendance_reverify_tasks includes SKIPPED in status ──
+    try {
+      if (await tableExists('attendance_reverify_tasks')) {
+        await pool.query(`ALTER TABLE attendance_reverify_tasks MODIFY COLUMN status ENUM('PENDING','COMPLETED','MISSED','SKIPPED','CANCELLED') NOT NULL DEFAULT 'PENDING'`);
+      }
+    } catch (err) {
+      console.warn('⚠️  attendance_reverify_tasks: could not modify status column —', err.message);
     }
 
     console.log('\n🎉 All migrations completed successfully.');

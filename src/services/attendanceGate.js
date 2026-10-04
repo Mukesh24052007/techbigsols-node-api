@@ -239,13 +239,14 @@ async function applyPresenceTransition({
     accuracy,
     lastInsideAt: nextState === 'INSIDE' ? utc : lastInsideAt,
     outsideSince,
+    leftAlertedAt: nextState === 'INSIDE' ? null : undefined,
   });
 
   return { success: updated, state: nextState, lastInsideAt, outsideSince };
 }
 
-async function createCheckInRecord({ user, office, profile, lat, lng, accuracy, ip }) {
-  const now = new Date();
+async function createCheckInRecord({ user, office, profile, lat, lng, accuracy, ip, at = new Date() }) {
+  const now = at instanceof Date ? at : new Date(at);
   const utc = toUtcDateTime(now);
   const attendanceDate = istCalendarDate(now);
   const status = isLate(office, profile, now) ? 'LATE' : 'PRESENT';

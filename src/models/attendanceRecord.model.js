@@ -1,10 +1,11 @@
 const { pool } = require('../config/db');
-const { sqlUtc, toUtcDateTime } = require('../utils/time');
+const { sqlUtc, toUtcDateTime, istCalendarDate } = require('../utils/time');
 
 function parseRecord(row) {
   if (!row) return null;
   return {
     ...row,
+    attendance_date: row.attendance_date instanceof Date ? istCalendarDate(row.attendance_date) : String(row.attendance_date),
     worked_minutes: Number(row.worked_minutes) || 0,
     check_in_lat: row.check_in_lat != null ? Number(row.check_in_lat) : null,
     check_in_lng: row.check_in_lng != null ? Number(row.check_in_lng) : null,
@@ -16,7 +17,7 @@ function parseRecord(row) {
 }
 
 const SELECT = `
-  id, user_id, attendance_date, fullname, office_id,
+  id, user_id, DATE_FORMAT(attendance_date, '%Y-%m-%d') AS attendance_date, fullname, office_id,
   ${sqlUtc('check_in_at')}, ${sqlUtc('check_out_at')},
   status, worked_minutes,
   check_in_lat, check_in_lng, check_in_accuracy,
