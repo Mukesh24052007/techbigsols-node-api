@@ -198,6 +198,42 @@ const migrate = async () => {
     // No foreign keys to site_users: deleting a site-user must keep working
     // and payroll history must survive. Indexed user_id + fullname snapshot.
     // DATETIME (not TIMESTAMP) so values are timezone-naive UTC strings.
+
+    // Read the actual collation and charset of site_users.user_id to prevent join collation mismatches
+    let userIdCollation = 'utf8mb4_unicode_ci';
+    let userIdCharset = 'utf8mb4';
+    try {
+      const [colInfo] = await pool.query(
+        `SELECT CHARACTER_SET_NAME, COLLATION_NAME
+         FROM information_schema.COLUMNS
+         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'site_users' AND COLUMN_NAME = 'user_id'
+         LIMIT 1`
+      );
+      if (colInfo && colInfo.length > 0 && colInfo[0].COLLATION_NAME) {
+        userIdCollation = colInfo[0].COLLATION_NAME;
+        userIdCharset = colInfo[0].CHARACTER_SET_NAME || 'utf8mb4';
+        console.log(`ℹ️  attendance: site_users.user_id collation detected as ${userIdCollation} (${userIdCharset})`);
+      } else {
+        const [tableInfo] = await pool.query(
+          `SELECT TABLE_COLLATION
+           FROM information_schema.TABLES
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'site_users'
+           LIMIT 1`
+        );
+        if (tableInfo && tableInfo.length > 0 && tableInfo[0].TABLE_COLLATION) {
+          userIdCollation = tableInfo[0].TABLE_COLLATION;
+          userIdCharset = userIdCollation.split('_')[0] || 'utf8mb4';
+          console.log(`ℹ️  attendance: site_users table collation detected as ${userIdCollation}`);
+        } else {
+          console.warn('⚠️  attendance: could not determine site_users collation, falling back to utf8mb4_unicode_ci');
+        }
+      }
+    } catch (err) {
+      console.warn('⚠️  attendance: error reading site_users collation, falling back to utf8mb4_unicode_ci:', err.message);
+    }
+
+    const userIdColDef = `VARCHAR(20) CHARACTER SET ${userIdCharset} COLLATE ${userIdCollation}`;
+
     const attendanceTables = [
       {
         name: 'attendance_offices',
@@ -227,7 +263,7 @@ const migrate = async () => {
         name: 'attendance_profiles',
         sql: `
           CREATE TABLE IF NOT EXISTS attendance_profiles (
-            user_id          VARCHAR(20)  NOT NULL PRIMARY KEY,
+            user_id          ${userIdColDef} NOT NULL PRIMARY KEY,
             department       VARCHAR(100) DEFAULT NULL,
             designation      VARCHAR(100) DEFAULT NULL,
             office_id        INT          DEFAULT NULL,
@@ -248,7 +284,7 @@ const migrate = async () => {
         sql: `
           CREATE TABLE IF NOT EXISTS attendance_records (
             id                  INT AUTO_INCREMENT PRIMARY KEY,
-            user_id             VARCHAR(20)  NOT NULL,
+            user_id             ${userIdColDef} NOT NULL,
             attendance_date     DATE         NOT NULL,
             fullname            VARCHAR(150) NOT NULL,
             office_id           INT          DEFAULT NULL,
@@ -277,7 +313,7 @@ const migrate = async () => {
         sql: `
           CREATE TABLE IF NOT EXISTS attendance_presence (
             record_id          INT          NOT NULL PRIMARY KEY,
-            user_id            VARCHAR(20)  NOT NULL,
+            user_id            ${userIdColDef} NOT NULL,
             state              ENUM('INSIDE','OUTSIDE','UNKNOWN') NOT NULL DEFAULT 'INSIDE',
             reason             VARCHAR(32)  DEFAULT NULL,
             outside_streak     INT          NOT NULL DEFAULT 0,
@@ -313,7 +349,7 @@ const migrate = async () => {
         sql: `
           CREATE TABLE IF NOT EXISTS attendance_challenges (
             id          CHAR(36)     NOT NULL PRIMARY KEY,
-            user_id     VARCHAR(20)  NOT NULL,
+            user_id     ${userIdColDef} NOT NULL,
             purpose     ENUM('checkin','reverify') NOT NULL,
             action      VARCHAR(32)  NOT NULL,
             issued_at   DATETIME     NOT NULL,
@@ -328,7 +364,7 @@ const migrate = async () => {
         sql: `
           CREATE TABLE IF NOT EXISTS attendance_attempts (
             id              INT AUTO_INCREMENT PRIMARY KEY,
-            user_id         VARCHAR(20)  NOT NULL,
+            user_id         ${userIdColDef} NOT NULL,
             kind            VARCHAR(32)  NOT NULL,
             success         TINYINT(1)   NOT NULL DEFAULT 0,
             distance_score  DECIMAL(8,6) DEFAULT NULL,
@@ -347,7 +383,7 @@ const migrate = async () => {
           CREATE TABLE IF NOT EXISTS attendance_reverify_tasks (
             id            INT AUTO_INCREMENT PRIMARY KEY,
             record_id     INT          NOT NULL,
-            user_id       VARCHAR(20)  NOT NULL,
+            user_id       ${userIdColDef} NOT NULL,
             scheduled_at  DATETIME     NOT NULL,
             due_at        DATETIME     NOT NULL,
             completed_at  DATETIME     DEFAULT NULL,
@@ -363,7 +399,7 @@ const migrate = async () => {
         sql: `
           CREATE TABLE IF NOT EXISTS attendance_regularizations (
             id               INT AUTO_INCREMENT PRIMARY KEY,
-            user_id          VARCHAR(20)  NOT NULL,
+            user_id          ${userIdColDef} NOT NULL,
             attendance_date  DATE         NOT NULL,
             reason           TEXT         NOT NULL,
             status           ENUM('PENDING','APPROVED','REJECTED') NOT NULL DEFAULT 'PENDING',
@@ -380,7 +416,7 @@ const migrate = async () => {
         sql: `
           CREATE TABLE IF NOT EXISTS attendance_leaves (
             id           INT AUTO_INCREMENT PRIMARY KEY,
-            user_id      VARCHAR(20)  NOT NULL,
+            user_id      ${userIdColDef} NOT NULL,
             leave_date   DATE         NOT NULL,
             reason       VARCHAR(500) DEFAULT NULL,
             status       ENUM('PENDING','APPROVED','REJECTED') NOT NULL DEFAULT 'PENDING',

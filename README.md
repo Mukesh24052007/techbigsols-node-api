@@ -135,6 +135,29 @@ Required CodeBuild environment variables: `AWS_ACCOUNT_ID`, `AWS_REGION`, `ECR_R
 | `JWT_SECRET` | Yes | Long random string — use `openssl rand -hex 64` |
 | `JWT_EXPIRES_IN` | No | Token TTL (default `1d`) |
 | `ALLOWED_ORIGINS` | Yes | Comma-separated allowed CORS origins |
+| `EXTRA_ALLOWED_ORIGINS` | No | Comma-separated extra CORS origins (e.g., dev/preview domains) |
+| `FACE_ENC_KEY` | Yes (in prod) | 32-byte key as 64 hex chars (`openssl rand -hex 32`) for AES-256-GCM face template encryption |
+| `FACE_MATCH_THRESHOLD` | No | Euclidean distance threshold for 1:1 face matching (default `0.5`) |
+| `FACE_REPLAY_EPSILON` | No | Pairwise Euclidean distance threshold for multi-frame replay detection (default `0.004`) |
+| `TRUSTED_PROXY_HOPS` | No | Number of reverse proxy hops to trust counting from right of `X-Forwarded-For` (default `1`) |
+
+---
+
+## Smoke & Acceptance Tests
+
+```bash
+# Run local smoke tests (health checks, CORS verification, unauthenticated route barriers)
+npm run smoke
+
+# When testing a remote deployment without making DB modifications:
+BASE_URL=https://api.techbigsolutions.in npm run smoke
+
+# Run acceptance test suites (local DB only)
+node scripts/test-phase2.js
+node scripts/test-phase3.js
+node scripts/test-phase4.js
+node scripts/benchmark-sweeper.js
+```
 
 ---
 
@@ -144,7 +167,47 @@ Required CodeBuild environment variables: `AWS_ACCOUNT_ID`, `AWS_REGION`, `ECR_R
 npm run migrate
 ```
 
+Migrations are strictly additive and idempotent:
+- Dynamic collation: tables inherit charset and collation from `site_users.user_id` without altering existing tables.
+- Creates `attendance_offices`, `attendance_profiles`, `attendance_records`, `attendance_intervals`, `attendance_attempts`, `attendance_presence`, `attendance_reverify_tasks`, `attendance_regularization_requests`, and `attendance_leaves`.
+- Safe to re-run in continuous deployment pipelines.
+
 ---
+
+## Deployment Checklist & Rollback
+
+### Production Checklist
+1. Ensure RDS MySQL 8.0+ is running with UTF8MB4 charset.
+2. Run database migration:
+   ```bash
+   npm run migrate
+   ```
+3. Set environment variables in Elastic Beanstalk / ECS:
+   ```bash
+   eb setenv FACE_ENC_KEY=$(openssl rand -hex 32) \
+              FACE_MATCH_THRESHOLD=0.5 \
+              TRUSTED_PROXY_HOPS=1 \
+              ALLOWED_ORIGINS=https://techbigsolutions.in,https://www.techbigsolutions.in
+   ```
+4. Deploy application:
+   ```bash
+   eb deploy
+   ```
+5. Verify deployment:
+   ```bash
+   BASE_URL=https://api.techbigsolutions.in npm run smoke
+   ```
+
+### Rollback Note
+- Attendance database migrations only create new `attendance_*` tables and do not modify existing `site_users` or `admins` tables.
+- If rolling back application code, previous application versions will ignore the `attendance_*` tables without error.
+
+---
+
+## Known Operational Limits
+- **Single Sweeper Leader**: Attendance sweeper uses MySQL cooperative lock `GET_LOCK('attendance_sweeper', 0)`. When running multiple API instances behind ALB, exactly one instance runs the 30s sweep; concurrent sweeps are safely skipped.
+- **SSE Stream Limit**: Maximum 5 concurrent SSE live connections per admin instance (`/api/attendance/admin/stream`).
+- **Face Liveness**: Client performs multi-frame challenge-response. The server applies replay rejection (`FACE_REPLAY_EPSILON`) and rate limits (lockout after 5 consecutive failures). Hardware biometrics / active depth cameras can be added if higher security assurance is required.
 
 ## Project structure
 

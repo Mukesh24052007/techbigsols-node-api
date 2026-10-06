@@ -54,6 +54,60 @@ async function performSweep(now = new Date()) {
   let reverifyScheduled = 0;
   let autoCheckoutCount = 0;
 
+  if (!records.length) {
+    return {
+      scanned: 0,
+      noSignalCount,
+      toleranceAlertCount,
+      reverifyViolations,
+      reverifyScheduled,
+      autoCheckoutCount,
+    };
+  }
+
+  const recordIds = records.map((r) => r.id);
+
+  // Batch Query 1: Fetch presence for all open records in ONE query
+  const [presenceRows] = await pool.query(
+    `SELECT record_id, user_id, state, reason, outside_streak, weak_streak,
+            DATE_FORMAT(last_heartbeat_at, '%Y-%m-%d %H:%i:%s') AS last_heartbeat_at,
+            DATE_FORMAT(last_inside_at, '%Y-%m-%d %H:%i:%s') AS last_inside_at,
+            DATE_FORMAT(outside_since, '%Y-%m-%d %H:%i:%s') AS outside_since,
+            last_lat, last_lng, last_accuracy,
+            DATE_FORMAT(left_alerted_at, '%Y-%m-%d %H:%i:%s') AS left_alerted_at,
+            DATE_FORMAT(updated_at, '%Y-%m-%d %H:%i:%s') AS updated_at
+     FROM attendance_presence
+     WHERE record_id IN (?)`,
+    [recordIds]
+  );
+  const presenceMap = new Map();
+  for (const row of presenceRows) {
+    presenceMap.set(row.record_id, {
+      ...row,
+      last_lat: row.last_lat != null ? Number(row.last_lat) : null,
+      last_lng: row.last_lng != null ? Number(row.last_lng) : null,
+      last_accuracy: row.last_accuracy != null ? Number(row.last_accuracy) : null,
+    });
+  }
+
+  // Batch Query 2: Fetch reverify tasks for all open records in ONE query
+  const [taskRows] = await pool.query(
+    `SELECT id, record_id, user_id,
+            DATE_FORMAT(scheduled_at, '%Y-%m-%d %H:%i:%s') AS scheduled_at,
+            DATE_FORMAT(due_at, '%Y-%m-%d %H:%i:%s') AS due_at,
+            DATE_FORMAT(completed_at, '%Y-%m-%d %H:%i:%s') AS completed_at,
+            status
+     FROM attendance_reverify_tasks
+     WHERE record_id IN (?)
+     ORDER BY scheduled_at ASC`,
+    [recordIds]
+  );
+  const tasksMap = new Map();
+  for (const t of taskRows) {
+    if (!tasksMap.has(t.record_id)) tasksMap.set(t.record_id, []);
+    tasksMap.get(t.record_id).push(t);
+  }
+
   for (const record of records) {
     const shiftEndHms = record.shift_end || '18:30:00';
     const shiftStartHms = record.shift_start || '09:30:00';
@@ -111,7 +165,7 @@ async function performSweep(now = new Date()) {
     }
 
     // ── 3a. NO SIGNAL ────────────────────────────────────────────────────────
-    let presence = await AttendancePresenceModel.findByRecordId(record.id);
+    let presence = presenceMap.get(record.id);
     if (presence && presence.state === 'INSIDE') {
       const heartbeatIntervalSec = record.heartbeat_seconds != null ? record.heartbeat_seconds : 60;
       const noSignalThresholdMs = 2 * heartbeatIntervalSec * 1000;
@@ -137,13 +191,13 @@ async function performSweep(now = new Date()) {
           });
           if (transitioned.success) {
             noSignalCount++;
+            presence = { ...presence, state: 'UNKNOWN', reason: 'no_signal' };
           }
         }
       }
     }
 
     // ── 3b. TOLERANCE ALERT ──────────────────────────────────────────────────
-    presence = await AttendancePresenceModel.findByRecordId(record.id);
     if (presence && (presence.state === 'OUTSIDE' || presence.state === 'UNKNOWN')) {
       const toleranceMinutes = record.outside_tolerance_minutes != null ? record.outside_tolerance_minutes : 10;
       const outsideSince = presence.outside_since || presence.last_inside_at || record.check_in_at;
@@ -180,7 +234,7 @@ async function performSweep(now = new Date()) {
     }
 
     // ── 3d. RE-VERIFICATION ──────────────────────────────────────────────────
-    const tasks = await AttendanceReverifyModel.findByRecord(record.id);
+    const tasks = tasksMap.get(record.id) || [];
 
     // 1. Check for expired pending tasks (due for 5 minutes)
     for (const task of tasks) {

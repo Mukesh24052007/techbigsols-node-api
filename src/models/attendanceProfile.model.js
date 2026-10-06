@@ -102,7 +102,7 @@ const AttendanceProfileModel = {
          ${sqlUtc('p.consent_at', 'consentAt')},
          ${sqlUtc('p.face_enrolled_at', 'faceEnrolledAt')}
        FROM site_users u
-       LEFT JOIN attendance_profiles p ON p.user_id = u.user_id COLLATE utf8mb4_unicode_ci
+       LEFT JOIN attendance_profiles p ON p.user_id = u.user_id
        LEFT JOIN attendance_offices o ON o.id = p.office_id
        WHERE u.is_active = 1
          AND JSON_CONTAINS(u.module_access, '"Attendance"')

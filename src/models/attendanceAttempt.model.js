@@ -62,7 +62,7 @@ const AttendanceAttemptModel = {
              ${sqlUtc('a.created_at')},
              u.fullname, p.department
       FROM attendance_attempts a
-      LEFT JOIN site_users u ON u.user_id COLLATE utf8mb4_unicode_ci = a.user_id
+      LEFT JOIN site_users u ON u.user_id = a.user_id
       LEFT JOIN attendance_profiles p ON p.user_id = a.user_id
       ${whereSql}
       ORDER BY a.id DESC

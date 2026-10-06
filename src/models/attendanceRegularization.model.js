@@ -28,7 +28,7 @@ const AttendanceRegularizationModel = {
               ${sqlUtc('r.reviewed_at')}, ${sqlUtc('r.created_at')},
               u.fullname, p.department
        FROM attendance_regularizations r
-       LEFT JOIN site_users u ON u.user_id COLLATE utf8mb4_unicode_ci = r.user_id
+       LEFT JOIN site_users u ON u.user_id = r.user_id
        LEFT JOIN attendance_profiles p ON p.user_id = r.user_id
        WHERE r.id = ?`,
       [id]
@@ -52,7 +52,7 @@ const AttendanceRegularizationModel = {
              ${sqlUtc('r.reviewed_at')}, ${sqlUtc('r.created_at')},
              u.fullname, p.department
       FROM attendance_regularizations r
-      LEFT JOIN site_users u ON u.user_id COLLATE utf8mb4_unicode_ci = r.user_id
+      LEFT JOIN site_users u ON u.user_id = r.user_id
       LEFT JOIN attendance_profiles p ON p.user_id = r.user_id
       ${whereSql}
       ORDER BY r.id DESC

@@ -1084,11 +1084,11 @@ const AttendanceController = {
              LIMIT 1
            ) AS pending_reverify_id
          FROM site_users u
-         LEFT JOIN attendance_profiles prof ON prof.user_id = u.user_id COLLATE utf8mb4_unicode_ci
+         LEFT JOIN attendance_profiles prof ON prof.user_id = u.user_id
          LEFT JOIN attendance_offices o ON o.id = prof.office_id
-         LEFT JOIN attendance_records r ON r.user_id = u.user_id COLLATE utf8mb4_unicode_ci AND r.attendance_date = ?
+         LEFT JOIN attendance_records r ON r.user_id = u.user_id AND r.attendance_date = ?
          LEFT JOIN attendance_presence p ON p.record_id = r.id
-         LEFT JOIN attendance_leaves l ON l.user_id = u.user_id COLLATE utf8mb4_unicode_ci AND l.leave_date = ? AND l.status = 'APPROVED'
+         LEFT JOIN attendance_leaves l ON l.user_id = u.user_id AND l.leave_date = ? AND l.status = 'APPROVED'
          WHERE u.is_active = 1
            AND JSON_CONTAINS(u.module_access, '"Attendance"')
          ORDER BY u.fullname ASC`,
@@ -1304,14 +1304,14 @@ const AttendanceController = {
            (
              SELECT COUNT(DISTINCT l.leave_date)
              FROM attendance_leaves l
-             WHERE l.user_id = u.user_id COLLATE utf8mb4_unicode_ci
+             WHERE l.user_id = u.user_id
                AND DATE_FORMAT(l.leave_date, '%Y-%m') = ?
                AND l.status = 'APPROVED'
            ) AS days_leave
          FROM site_users u
-         LEFT JOIN attendance_profiles prof ON prof.user_id = u.user_id COLLATE utf8mb4_unicode_ci
+         LEFT JOIN attendance_profiles prof ON prof.user_id = u.user_id
          LEFT JOIN attendance_records r
-           ON r.user_id = u.user_id COLLATE utf8mb4_unicode_ci
+           ON r.user_id = u.user_id
            AND DATE_FORMAT(r.attendance_date, '%Y-%m') = ?
          WHERE u.is_active = 1
            AND JSON_CONTAINS(u.module_access, '"Attendance"')

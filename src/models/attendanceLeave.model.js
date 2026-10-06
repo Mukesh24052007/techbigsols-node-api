@@ -20,7 +20,7 @@ const AttendanceLeaveModel = {
     const [rows] = await pool.query(
       `SELECT ${SELECT}, u.fullname, p.department
        FROM attendance_leaves l
-       LEFT JOIN site_users u ON u.user_id COLLATE utf8mb4_unicode_ci = l.user_id
+       LEFT JOIN site_users u ON u.user_id = l.user_id
        LEFT JOIN attendance_profiles p ON p.user_id = l.user_id
        WHERE l.id = ?`,
       [id]
@@ -91,7 +91,7 @@ const AttendanceLeaveModel = {
     const sql = `
       SELECT ${SELECT}, u.fullname, p.department
       FROM attendance_leaves l
-      LEFT JOIN site_users u ON u.user_id COLLATE utf8mb4_unicode_ci = l.user_id
+      LEFT JOIN site_users u ON u.user_id = l.user_id
       LEFT JOIN attendance_profiles p ON p.user_id = l.user_id
       ${whereSql}
       ORDER BY l.leave_date DESC, l.id DESC
