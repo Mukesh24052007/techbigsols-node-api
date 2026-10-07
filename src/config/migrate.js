@@ -194,6 +194,339 @@ const migrate = async () => {
       console.log('✅ site_users schema upgrade complete');
     }
 
+    // ── 5. Attendance module ─────────────────────────────────────────────────
+    // No foreign keys to site_users: deleting a site-user must keep working
+    // and payroll history must survive. Indexed user_id + fullname snapshot.
+    // DATETIME (not TIMESTAMP) so values are timezone-naive UTC strings.
+
+    // Read the actual collation and charset of site_users.user_id to prevent join collation mismatches
+    let userIdCollation = 'utf8mb4_unicode_ci';
+    let userIdCharset = 'utf8mb4';
+    try {
+      const [colInfo] = await pool.query(
+        `SELECT CHARACTER_SET_NAME, COLLATION_NAME
+         FROM information_schema.COLUMNS
+         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'site_users' AND COLUMN_NAME = 'user_id'
+         LIMIT 1`
+      );
+      if (colInfo && colInfo.length > 0 && colInfo[0].COLLATION_NAME) {
+        userIdCollation = colInfo[0].COLLATION_NAME;
+        userIdCharset = colInfo[0].CHARACTER_SET_NAME || 'utf8mb4';
+        console.log(`ℹ️  attendance: site_users.user_id collation detected as ${userIdCollation} (${userIdCharset})`);
+      } else {
+        const [tableInfo] = await pool.query(
+          `SELECT TABLE_COLLATION
+           FROM information_schema.TABLES
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'site_users'
+           LIMIT 1`
+        );
+        if (tableInfo && tableInfo.length > 0 && tableInfo[0].TABLE_COLLATION) {
+          userIdCollation = tableInfo[0].TABLE_COLLATION;
+          userIdCharset = userIdCollation.split('_')[0] || 'utf8mb4';
+          console.log(`ℹ️  attendance: site_users table collation detected as ${userIdCollation}`);
+        } else {
+          console.warn('⚠️  attendance: could not determine site_users collation, falling back to utf8mb4_unicode_ci');
+        }
+      }
+    } catch (err) {
+      console.warn('⚠️  attendance: error reading site_users collation, falling back to utf8mb4_unicode_ci:', err.message);
+    }
+
+    const userIdColDef = `VARCHAR(20) CHARACTER SET ${userIdCharset} COLLATE ${userIdCollation}`;
+
+    const attendanceTables = [
+      {
+        name: 'attendance_offices',
+        sql: `
+          CREATE TABLE IF NOT EXISTS attendance_offices (
+            id                         INT AUTO_INCREMENT PRIMARY KEY,
+            name                       VARCHAR(150)  NOT NULL,
+            lat                        DECIMAL(10,7) NOT NULL,
+            lng                        DECIMAL(10,7) NOT NULL,
+            radius_m                   INT           NOT NULL DEFAULT 150,
+            accuracy_max_m             INT           NOT NULL DEFAULT 50,
+            ip_allowlist               JSON          DEFAULT NULL,
+            require_both               TINYINT(1)    NOT NULL DEFAULT 0,
+            shift_start                TIME          NOT NULL DEFAULT '09:30:00',
+            shift_end                  TIME          NOT NULL DEFAULT '18:30:00',
+            grace_minutes              INT           NOT NULL DEFAULT 10,
+            outside_tolerance_minutes  INT           NOT NULL DEFAULT 10,
+            short_outing_allowance_minutes INT       NOT NULL DEFAULT 30,
+            heartbeat_seconds          INT           NOT NULL DEFAULT 60,
+            reverify_count             INT           NOT NULL DEFAULT 2,
+            created_at                 DATETIME      NOT NULL,
+            updated_at                 DATETIME      NOT NULL
+          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        `,
+      },
+      {
+        name: 'attendance_profiles',
+        sql: `
+          CREATE TABLE IF NOT EXISTS attendance_profiles (
+            user_id          ${userIdColDef} NOT NULL PRIMARY KEY,
+            department       VARCHAR(100) DEFAULT NULL,
+            designation      VARCHAR(100) DEFAULT NULL,
+            office_id        INT          DEFAULT NULL,
+            shift_start      TIME         DEFAULT NULL,
+            shift_end        TIME         DEFAULT NULL,
+            face_template    VARBINARY(1024) DEFAULT NULL,
+            face_enrolled_at DATETIME     DEFAULT NULL,
+            consent_at       DATETIME     DEFAULT NULL,
+            consent_version  VARCHAR(32)  DEFAULT NULL,
+            created_at       DATETIME     NOT NULL,
+            updated_at       DATETIME     NOT NULL,
+            INDEX idx_att_profiles_office (office_id)
+          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        `,
+      },
+      {
+        name: 'attendance_records',
+        sql: `
+          CREATE TABLE IF NOT EXISTS attendance_records (
+            id                  INT AUTO_INCREMENT PRIMARY KEY,
+            user_id             ${userIdColDef} NOT NULL,
+            attendance_date     DATE         NOT NULL,
+            fullname            VARCHAR(150) NOT NULL,
+            office_id           INT          DEFAULT NULL,
+            check_in_at         DATETIME     DEFAULT NULL,
+            check_out_at        DATETIME     DEFAULT NULL,
+            status              ENUM('PRESENT','LATE','AUTO_CHECKOUT','ABSENT') NOT NULL DEFAULT 'ABSENT',
+            worked_minutes      INT          NOT NULL DEFAULT 0,
+            check_in_lat        DECIMAL(10,7) DEFAULT NULL,
+            check_in_lng        DECIMAL(10,7) DEFAULT NULL,
+            check_in_accuracy   DECIMAL(8,2)  DEFAULT NULL,
+            check_out_lat       DECIMAL(10,7) DEFAULT NULL,
+            check_out_lng       DECIMAL(10,7) DEFAULT NULL,
+            check_out_accuracy  DECIMAL(8,2)  DEFAULT NULL,
+            ip                  VARCHAR(45)  DEFAULT NULL,
+            created_at          DATETIME     NOT NULL,
+            updated_at          DATETIME     NOT NULL,
+            UNIQUE KEY uq_att_records_user_date (user_id, attendance_date),
+            INDEX idx_att_records_date (attendance_date),
+            INDEX idx_att_records_office (office_id),
+            INDEX idx_att_records_status (attendance_date, status)
+          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        `,
+      },
+      {
+        name: 'attendance_presence',
+        sql: `
+          CREATE TABLE IF NOT EXISTS attendance_presence (
+            record_id          INT          NOT NULL PRIMARY KEY,
+            user_id            ${userIdColDef} NOT NULL,
+            state              ENUM('INSIDE','OUTSIDE','UNKNOWN') NOT NULL DEFAULT 'INSIDE',
+            reason             VARCHAR(32)  DEFAULT NULL,
+            outside_streak     INT          NOT NULL DEFAULT 0,
+            weak_streak        INT          NOT NULL DEFAULT 0,
+            last_heartbeat_at  DATETIME     DEFAULT NULL,
+            last_inside_at     DATETIME     DEFAULT NULL,
+            outside_since      DATETIME     DEFAULT NULL,
+            last_lat           DECIMAL(10,7) DEFAULT NULL,
+            last_lng           DECIMAL(10,7) DEFAULT NULL,
+            last_accuracy      DECIMAL(8,2)  DEFAULT NULL,
+            left_alerted_at    DATETIME     DEFAULT NULL,
+            updated_at         DATETIME     NOT NULL,
+            INDEX idx_att_presence_user (user_id),
+            INDEX idx_att_presence_state (state)
+          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        `,
+      },
+      {
+        name: 'attendance_intervals',
+        sql: `
+          CREATE TABLE IF NOT EXISTS attendance_intervals (
+            id          INT AUTO_INCREMENT PRIMARY KEY,
+            record_id   INT          NOT NULL,
+            state       ENUM('INSIDE','OUTSIDE','UNKNOWN') NOT NULL,
+            started_at  DATETIME     NOT NULL,
+            ended_at    DATETIME     DEFAULT NULL,
+            INDEX idx_att_intervals_record (record_id, ended_at)
+          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        `,
+      },
+      {
+        name: 'attendance_challenges',
+        sql: `
+          CREATE TABLE IF NOT EXISTS attendance_challenges (
+            id          CHAR(36)     NOT NULL PRIMARY KEY,
+            user_id     ${userIdColDef} NOT NULL,
+            purpose     ENUM('checkin','reverify') NOT NULL,
+            action      VARCHAR(32)  NOT NULL,
+            issued_at   DATETIME     NOT NULL,
+            expires_at  DATETIME     NOT NULL,
+            used_at     DATETIME     DEFAULT NULL,
+            INDEX idx_att_challenges_user (user_id, purpose, issued_at)
+          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        `,
+      },
+      {
+        name: 'attendance_attempts',
+        sql: `
+          CREATE TABLE IF NOT EXISTS attendance_attempts (
+            id              INT AUTO_INCREMENT PRIMARY KEY,
+            user_id         ${userIdColDef} NOT NULL,
+            kind            VARCHAR(32)  NOT NULL,
+            success         TINYINT(1)   NOT NULL DEFAULT 0,
+            distance_score  DECIMAL(8,6) DEFAULT NULL,
+            accuracy        DECIMAL(8,2) DEFAULT NULL,
+            ip              VARCHAR(45)  DEFAULT NULL,
+            reason          VARCHAR(255) DEFAULT NULL,
+            created_at      DATETIME     NOT NULL,
+            INDEX idx_att_attempts_user_created (user_id, created_at),
+            INDEX idx_att_attempts_kind (kind, created_at)
+          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        `,
+      },
+      {
+        name: 'attendance_reverify_tasks',
+        sql: `
+          CREATE TABLE IF NOT EXISTS attendance_reverify_tasks (
+            id            INT AUTO_INCREMENT PRIMARY KEY,
+            record_id     INT          NOT NULL,
+            user_id       ${userIdColDef} NOT NULL,
+            scheduled_at  DATETIME     NOT NULL,
+            due_at        DATETIME     NOT NULL,
+            completed_at  DATETIME     DEFAULT NULL,
+            status        ENUM('PENDING','COMPLETED','MISSED','SKIPPED','CANCELLED') NOT NULL DEFAULT 'PENDING',
+            INDEX idx_att_reverify_record (record_id),
+            INDEX idx_att_reverify_due (status, due_at),
+            INDEX idx_att_reverify_user (user_id, scheduled_at)
+          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        `,
+      },
+      {
+        name: 'attendance_regularizations',
+        sql: `
+          CREATE TABLE IF NOT EXISTS attendance_regularizations (
+            id               INT AUTO_INCREMENT PRIMARY KEY,
+            user_id          ${userIdColDef} NOT NULL,
+            attendance_date  DATE         NOT NULL,
+            reason           TEXT         NOT NULL,
+            status           ENUM('PENDING','APPROVED','REJECTED') NOT NULL DEFAULT 'PENDING',
+            reviewed_by      INT          DEFAULT NULL,
+            reviewed_at      DATETIME     DEFAULT NULL,
+            created_at       DATETIME     NOT NULL,
+            INDEX idx_att_reg_user_date (user_id, attendance_date),
+            INDEX idx_att_reg_status (status)
+          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        `,
+      },
+      {
+        name: 'attendance_leaves',
+        sql: `
+          CREATE TABLE IF NOT EXISTS attendance_leaves (
+            id           INT AUTO_INCREMENT PRIMARY KEY,
+            user_id      ${userIdColDef} NOT NULL,
+            leave_date   DATE         NOT NULL,
+            reason       VARCHAR(500) DEFAULT NULL,
+            status       ENUM('PENDING','APPROVED','REJECTED') NOT NULL DEFAULT 'PENDING',
+            reviewed_by  INT          DEFAULT NULL,
+            reviewed_at  DATETIME     DEFAULT NULL,
+            created_at   DATETIME     NOT NULL,
+            UNIQUE KEY uq_att_leaves_user_date (user_id, leave_date),
+            INDEX idx_att_leaves_date_status (leave_date, status)
+          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        `,
+      },
+      {
+        name: 'attendance_audit_log',
+        sql: `
+          CREATE TABLE IF NOT EXISTS attendance_audit_log (
+            id              INT AUTO_INCREMENT PRIMARY KEY,
+            actor_admin_id  INT          NOT NULL,
+            action          VARCHAR(64)  NOT NULL,
+            entity_type     VARCHAR(64)  NOT NULL,
+            entity_id       VARCHAR(64)  NOT NULL,
+            before_json     JSON         DEFAULT NULL,
+            after_json      JSON         DEFAULT NULL,
+            created_at      DATETIME     NOT NULL,
+            INDEX idx_att_audit_entity (entity_type, entity_id),
+            INDEX idx_att_audit_created (created_at)
+          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        `,
+      },
+    ];
+
+    const failedAttendanceTables = [];
+    for (const table of attendanceTables) {
+      try {
+        await pool.query(table.sql);
+        console.log(`✅ ${table.name} table ready`);
+      } catch (err) {
+        failedAttendanceTables.push(table.name);
+        console.warn(`⚠️  ${table.name}:`, err.message);
+      }
+    }
+
+    if (failedAttendanceTables.length > 0) {
+      console.warn(`\n⚠️  ${failedAttendanceTables.length} attendance table(s) failed: ${failedAttendanceTables.join(', ')}`);
+    }
+
+    // ── Guarded upgrade: add columns to attendance_presence if missing ──
+    try {
+      if (await tableExists('attendance_presence')) {
+        if (!(await columnExists('attendance_presence', 'outside_streak'))) {
+          await pool.query(`ALTER TABLE attendance_presence ADD COLUMN outside_streak INT NOT NULL DEFAULT 0 AFTER state`);
+          console.log('✅ attendance_presence: outside_streak column added');
+        }
+        if (!(await columnExists('attendance_presence', 'reason'))) {
+          await pool.query(`ALTER TABLE attendance_presence ADD COLUMN reason VARCHAR(32) DEFAULT NULL AFTER state`);
+          console.log('✅ attendance_presence: reason column added');
+        }
+        if (!(await columnExists('attendance_presence', 'weak_streak'))) {
+          await pool.query(`ALTER TABLE attendance_presence ADD COLUMN weak_streak INT NOT NULL DEFAULT 0 AFTER outside_streak`);
+          console.log('✅ attendance_presence: weak_streak column added');
+        }
+        if (!(await columnExists('attendance_presence', 'left_alerted_at'))) {
+          await pool.query(`ALTER TABLE attendance_presence ADD COLUMN left_alerted_at DATETIME DEFAULT NULL AFTER last_accuracy`);
+          console.log('✅ attendance_presence: left_alerted_at column added');
+        }
+      }
+    } catch (err) {
+      console.warn('⚠️  attendance_presence: could not add columns —', err.message);
+    }
+
+    // ── Guarded upgrade: add checkout coordinates to attendance_records if missing ──
+    try {
+      if (await tableExists('attendance_records')) {
+        if (!(await columnExists('attendance_records', 'check_out_lat'))) {
+          await pool.query(`ALTER TABLE attendance_records ADD COLUMN check_out_lat DECIMAL(10,7) DEFAULT NULL AFTER check_in_accuracy`);
+          console.log('✅ attendance_records: check_out_lat column added');
+        }
+        if (!(await columnExists('attendance_records', 'check_out_lng'))) {
+          await pool.query(`ALTER TABLE attendance_records ADD COLUMN check_out_lng DECIMAL(10,7) DEFAULT NULL AFTER check_out_lat`);
+          console.log('✅ attendance_records: check_out_lng column added');
+        }
+        if (!(await columnExists('attendance_records', 'check_out_accuracy'))) {
+          await pool.query(`ALTER TABLE attendance_records ADD COLUMN check_out_accuracy DECIMAL(8,2) DEFAULT NULL AFTER check_out_lng`);
+          console.log('✅ attendance_records: check_out_accuracy column added');
+        }
+      }
+    } catch (err) {
+      console.warn('⚠️  attendance_records: could not add check_out columns —', err.message);
+    }
+
+    // ── Guarded upgrade: add short_outing_allowance_minutes to attendance_offices if missing ──
+    try {
+      if (await tableExists('attendance_offices')) {
+        if (!(await columnExists('attendance_offices', 'short_outing_allowance_minutes'))) {
+          await pool.query(`ALTER TABLE attendance_offices ADD COLUMN short_outing_allowance_minutes INT NOT NULL DEFAULT 30 AFTER outside_tolerance_minutes`);
+          console.log('✅ attendance_offices: short_outing_allowance_minutes column added');
+        }
+      }
+    } catch (err) {
+      console.warn('⚠️  attendance_offices: could not add short_outing_allowance_minutes —', err.message);
+    }
+
+    // ── Guarded upgrade: ensure attendance_reverify_tasks includes SKIPPED in status ──
+    try {
+      if (await tableExists('attendance_reverify_tasks')) {
+        await pool.query(`ALTER TABLE attendance_reverify_tasks MODIFY COLUMN status ENUM('PENDING','COMPLETED','MISSED','SKIPPED','CANCELLED') NOT NULL DEFAULT 'PENDING'`);
+      }
+    } catch (err) {
+      console.warn('⚠️  attendance_reverify_tasks: could not modify status column —', err.message);
+    }
+
     console.log('\n🎉 All migrations completed successfully.');
     process.exit(0);
 

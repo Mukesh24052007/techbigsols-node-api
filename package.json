@@ -9,6 +9,7 @@
     "migrate": "node src/config/migrate.js",
     "seed": "node src/config/seed.js",
     "migrate:seed": "node src/config/migrate.js && node src/config/seed.js",
+    "smoke": "node scripts/smoke.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "repository": {

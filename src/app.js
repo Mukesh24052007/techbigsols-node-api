@@ -9,6 +9,7 @@ const authRoutes = require('./routes/auth.routes');
 const productRoutes = require('./routes/product.routes');
 const userMasterRoutes = require('./routes/userMaster.routes');
 const siteAuthRoutes = require('./routes/siteAuth.routes');
+const attendanceRoutes = require('./routes/attendance.routes');
 const { notFound, errorHandler } = require('./middlewares/error.middleware');
 
 const app = express();
@@ -19,6 +20,23 @@ const allowedOrigins = [
   'https://www.techbigsolutions.in',
   'http://localhost:3000'
 ];
+
+if (process.env.EXTRA_ALLOWED_ORIGINS) {
+  for (const raw of process.env.EXTRA_ALLOWED_ORIGINS.split(',')) {
+    const origin = raw.trim();
+    if (origin && !allowedOrigins.includes(origin)) {
+      allowedOrigins.push(origin);
+    }
+  }
+}
+
+if (process.env.NODE_ENV !== 'production') {
+  for (const origin of ['http://localhost:3000', 'http://127.0.0.1:3000']) {
+    if (!allowedOrigins.includes(origin)) {
+      allowedOrigins.push(origin);
+    }
+  }
+}
 
 // Security & utility middleware
 app.use(helmet());
@@ -59,6 +77,7 @@ app.use('/api/auth', authRoutes);
 app.use('/api/products', productRoutes);
 app.use('/api/user-master', userMasterRoutes);   // admin-managed site-users
 app.use('/api/site-auth', siteAuthRoutes);        // site-user login portal
+app.use('/api/attendance', attendanceRoutes);
 
 // Error handling
 app.use(notFound);
