@@ -5,6 +5,7 @@ const {
   httpError,
   finiteNumber,
   assertLatLngAccuracy,
+  assertDescriptor,
   assertDescriptors,
   clientIp,
   parseMonth,
@@ -12,7 +13,7 @@ const {
   validateOfficeInput,
 } = require('../utils/attendanceValidate');
 const { haversineMetres } = require('../utils/geo');
-const { encryptEmbedding } = require('../utils/crypto');
+const { encryptEmbedding, encryptBuffer, decryptBuffer } = require('../utils/crypto');
 const {
   euclideanDistance,
   averageDescriptors,
@@ -25,6 +26,7 @@ const { toCsv } = require('../utils/csv');
 const attendanceBus = require('../services/attendanceBus');
 
 const {
+  resolveOfficeForUser,
   loadProfileAndOffice,
   assertNotLocked,
   recordAttempt,
@@ -165,7 +167,7 @@ const AttendanceController = {
 
       assertLocation(office, lat, lng, accuracy, ip);
 
-      const challenge = await createChallenge({ userId, purpose });
+      const challenge = await createChallenge({ userId, purpose, lat, lng });
       return res.status(200).json({
         success: true,
         message: 'Challenge issued',
@@ -210,7 +212,7 @@ const AttendanceController = {
       const { profile, office } = await loadProfileAndOffice(userId);
       requireConsent(profile, 'check-in');
 
-      await loadAndValidateChallenge({ challengeId, userId, purpose: 'checkin' });
+      await loadAndValidateChallenge({ challengeId, userId, purpose: 'checkin', lat, lng });
 
       // Atomically consume challenge
       const marked = await AttendanceChallengeModel.markUsed(challengeId, toUtcDateTime(new Date()));
@@ -298,9 +300,12 @@ const AttendanceController = {
         throw httpError(409, 'No open attendance record found for today.');
       }
 
-      const office = await AttendanceOfficeModel.findById(record.office_id);
+      let office = null;
+      if (record.office_id) {
+        office = await AttendanceOfficeModel.findById(record.office_id);
+      }
       if (!office) {
-        throw httpError(400, 'Assigned office was not found.');
+        office = await resolveOfficeForUser(userId);
       }
 
       const L = Number(office.accuracy_max_m) || 50;
@@ -489,7 +494,7 @@ const AttendanceController = {
         throw httpError(409, 'No open attendance record found for today.');
       }
 
-      await loadAndValidateChallenge({ challengeId, userId, purpose: 'reverify' });
+      await loadAndValidateChallenge({ challengeId, userId, purpose: 'reverify', lat, lng });
 
       // Atomically consume challenge
       const marked = await AttendanceChallengeModel.markUsed(challengeId, toUtcDateTime(new Date()));
@@ -609,7 +614,13 @@ const AttendanceController = {
       await AttendanceIntervalModel.closeOpen(record.id, utc);
 
       // Compute worked minutes via shared policy utility
-      const office = await AttendanceOfficeModel.findById(record.office_id);
+      let office = null;
+      if (record.office_id) {
+        office = await AttendanceOfficeModel.findById(record.office_id);
+      }
+      if (!office) {
+        office = await resolveOfficeForUser(userId).catch(() => null);
+      }
       const intervals = await AttendanceIntervalModel.findAllByRecord(record.id);
       const workedMinutes = computeWorkedMinutes({
         checkInAt: record.check_in_at,
@@ -721,7 +732,7 @@ const AttendanceController = {
       const descriptors = assertDescriptors(req.body?.descriptors, 5, 'descriptors');
 
       const profile = await AttendanceProfileModel.findByUserId(userId);
-      if (!profile?.consent_at) {
+      if (!profile?.consent_at && !profile?.admin_consent_at) {
         throw httpError(403, 'Employee consent is required before face enrolment.');
       }
 
@@ -741,14 +752,14 @@ const AttendanceController = {
 
       const template = averageDescriptors(descriptors);
       const encrypted = encryptEmbedding(template);
-      await AttendanceProfileModel.upsertFace(userId, encrypted);
+      await AttendanceProfileModel.upsertFace(userId, encrypted, 'LIVE');
 
       await AttendanceAuditLogModel.log({
         actorAdminId: req.admin.id,
         action: 'enrol_face',
         entityType: 'employee',
         entityId: userId,
-        afterJson: { enrolled_at: new Date().toISOString() },
+        afterJson: { enrolled_at: new Date().toISOString(), enrol_source: 'LIVE' },
       });
 
       return res.status(200).json({
@@ -783,6 +794,159 @@ const AttendanceController = {
         success: true,
         message: 'Face template deleted successfully',
         data: { userId },
+      });
+    } catch (err) {
+      next(err);
+    }
+  },
+
+  /**
+   * POST /api/attendance/admin/employees/:userId/photo
+   */
+  async adminEnrolPhoto(req, res, next) {
+    try {
+      const userId = req.params.userId;
+      const { photo, descriptors, consentAttested } = req.body || {};
+
+      if (!photo || typeof photo !== 'string' || photo.startsWith('data:')) {
+        throw httpError(400, 'photo must be a valid base64-encoded string without data: prefix.');
+      }
+
+      const photoBuf = Buffer.from(photo, 'base64');
+      if (photoBuf.length > 60000) {
+        throw httpError(400, 'Photo is too large, maximum 60 KB after compression');
+      }
+
+      let photoMime = null;
+      if (photoBuf.length >= 3 && photoBuf[0] === 0xFF && photoBuf[1] === 0xD8 && photoBuf[2] === 0xFF) {
+        photoMime = 'image/jpeg';
+      } else if (photoBuf.length >= 8 && photoBuf[0] === 0x89 && photoBuf[1] === 0x50 && photoBuf[2] === 0x4E && photoBuf[3] === 0x47) {
+        photoMime = 'image/png';
+      } else {
+        throw httpError(400, 'Invalid photo format. Only JPEG and PNG are allowed.');
+      }
+
+      const siteUser = await SiteUserModel.findById(userId);
+      if (!siteUser) {
+        throw httpError(400, 'Site user not found.');
+      }
+
+      const modules = Array.isArray(siteUser.moduleAccess)
+        ? siteUser.moduleAccess
+        : (Array.isArray(siteUser.module_access) ? siteUser.module_access : []);
+      if (!modules.includes('Attendance')) {
+        throw httpError(400, 'Employee does not have Attendance module access.');
+      }
+
+      if (consentAttested !== true) {
+        throw httpError(400, 'consentAttested must be true.');
+      }
+
+      if (!Array.isArray(descriptors) || descriptors.length < 1 || descriptors.length > 5) {
+        throw httpError(400, 'descriptors must contain between 1 and 5 arrays of 128 numbers.');
+      }
+
+      const validatedDescriptors = descriptors.map((d, i) => assertDescriptor(d, `descriptors[${i}]`));
+
+      if (validatedDescriptors.length >= 2) {
+        let totalDist = 0;
+        let pairs = 0;
+        for (let i = 0; i < validatedDescriptors.length; i += 1) {
+          for (let j = i + 1; j < validatedDescriptors.length; j += 1) {
+            totalDist += euclideanDistance(validatedDescriptors[i], validatedDescriptors[j]);
+            pairs += 1;
+          }
+        }
+        const meanDist = totalDist / pairs;
+        if (meanDist > 0.6) {
+          throw httpError(400, 'Face descriptors differ too much from each other. Ensure consistent lighting and posture.');
+        }
+      }
+
+      const template = validatedDescriptors.length === 1
+        ? validatedDescriptors[0]
+        : averageDescriptors(validatedDescriptors);
+
+      const encryptedTemplate = encryptEmbedding(template);
+      const encryptedPhoto = encryptBuffer(photoBuf);
+      const now = toUtcDateTime();
+      const enrolledAt = new Date().toISOString();
+
+      await AttendanceProfileModel.savePhotoAndFace(userId, {
+        photoEnc: encryptedPhoto,
+        photoMime,
+        faceTemplate: encryptedTemplate,
+        enrolSource: 'PHOTO',
+        adminConsentBy: String(req.admin.id),
+        now,
+      });
+
+      await AttendanceAuditLogModel.log({
+        actorAdminId: req.admin.id,
+        action: 'enrol_photo',
+        entityType: 'employee',
+        entityId: userId,
+        afterJson: {
+          enrolledAt,
+          enrolSource: 'PHOTO',
+          hasPhoto: true,
+        },
+      });
+
+      return res.status(200).json({
+        success: true,
+        message: 'Photo and face template enrolled successfully',
+        data: {
+          userId,
+          enrolledAt,
+          enrolSource: 'PHOTO',
+          hasPhoto: true,
+        },
+      });
+    } catch (err) {
+      next(err);
+    }
+  },
+
+  /**
+   * GET /api/attendance/admin/employees/:userId/photo
+   */
+  async adminGetPhoto(req, res, next) {
+    try {
+      const userId = req.params.userId;
+      const row = await AttendanceProfileModel.getPhoto(userId);
+      if (!row || !row.photo_enc) {
+        throw httpError(404, 'Photo not found for this employee.');
+      }
+
+      const buf = decryptBuffer(row.photo_enc);
+      res.setHeader('Content-Type', row.photo_mime || 'image/jpeg');
+      res.setHeader('Cache-Control', 'no-store');
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      return res.status(200).send(buf);
+    } catch (err) {
+      next(err);
+    }
+  },
+
+  /**
+   * DELETE /api/attendance/admin/employees/:userId/photo
+   */
+  async adminDeletePhoto(req, res, next) {
+    try {
+      const userId = req.params.userId;
+      await AttendanceProfileModel.clearPhoto(userId);
+
+      await AttendanceAuditLogModel.log({
+        actorAdminId: req.admin.id,
+        action: 'delete_photo',
+        entityType: 'employee',
+        entityId: userId,
+      });
+
+      return res.status(200).json({
+        success: true,
+        message: 'Photo deleted successfully',
       });
     } catch (err) {
       next(err);
@@ -859,6 +1023,11 @@ const AttendanceController = {
       if (!existing) throw httpError(404, 'Office not found.');
 
       const data = validateOfficeInput(req.body, true);
+      const nextLat = data.lat !== undefined ? data.lat : existing.lat;
+      const nextLng = data.lng !== undefined ? data.lng : existing.lng;
+      if (nextLat === 0 && nextLng === 0) {
+        throw httpError(400, 'Latitude and longitude cannot both be 0.');
+      }
       await AttendanceOfficeModel.update(id, data);
       const updated = await AttendanceOfficeModel.findById(id);
 
@@ -1094,6 +1263,19 @@ const AttendanceController = {
          ORDER BY u.fullname ASC`,
         [today, today]
       );
+
+      // If any employee lacks office settings, resolve using resolveOfficeForUser
+      for (const r of rows) {
+        if (r.outside_tolerance_minutes == null || r.short_outing_allowance_minutes == null) {
+          try {
+            const off = await resolveOfficeForUser(r.employee_id);
+            if (off) {
+              if (r.outside_tolerance_minutes == null) r.outside_tolerance_minutes = off.outside_tolerance_minutes;
+              if (r.short_outing_allowance_minutes == null) r.short_outing_allowance_minutes = off.short_outing_allowance_minutes;
+            }
+          } catch {}
+        }
+      }
 
       // Collect open record IDs for Query 2
       const openRecordIds = rows

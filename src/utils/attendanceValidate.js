@@ -13,13 +13,28 @@ function finiteNumber(value, name) {
 }
 
 function assertLatLngAccuracy(body) {
-  const lat = finiteNumber(body.lat, 'lat');
-  const lng = finiteNumber(body.lng, 'lng');
-  const accuracy = finiteNumber(body.accuracy, 'accuracy');
-  if (lat < -90 || lat > 90) throw httpError(400, 'lat must be between -90 and 90.');
-  if (lng < -180 || lng > 180) throw httpError(400, 'lng must be between -180 and 180.');
-  if (accuracy < 0) throw httpError(400, 'accuracy must be 0 or greater.');
-  return { lat, lng, accuracy };
+  const lat = finiteNumber(body.lat, 'Latitude');
+  const lng = finiteNumber(body.lng, 'Longitude');
+  const accuracy = finiteNumber(body.accuracy, 'Accuracy');
+  if (lat < -90 || lat > 90) throw httpError(400, 'Latitude must be between -90 and 90.');
+  if (lng < -180 || lng > 180) throw httpError(400, 'Longitude must be between -180 and 180.');
+  if (accuracy <= 0) throw httpError(400, 'Accuracy must be greater than 0.');
+  if (lat === 0 && lng === 0) throw httpError(400, 'Latitude and longitude cannot both be 0.');
+
+  let fixTimestamp = null;
+  if (body.fixTimestamp !== undefined && body.fixTimestamp !== null) {
+    const ts = typeof body.fixTimestamp === 'number' ? body.fixTimestamp : Number(body.fixTimestamp);
+    if (!Number.isFinite(ts)) {
+      throw httpError(400, 'Location is out of date. Please refresh your location.');
+    }
+    const now = Date.now();
+    if (now - ts > 60000 || ts - now > 10000) {
+      throw httpError(400, 'Location is out of date. Please refresh your location.');
+    }
+    fixTimestamp = ts;
+  }
+
+  return { lat, lng, accuracy, fixTimestamp };
 }
 
 function assertDescriptor(arr, label) {
@@ -87,78 +102,84 @@ function validateOfficeInput(body, isUpdate = false) {
 
   if (!isUpdate || body.name !== undefined) {
     if (!body.name || typeof body.name !== 'string' || !body.name.trim()) {
-      throw httpError(400, 'name is required and must be a non-empty string.');
+      throw httpError(400, 'Office name is required and must be a non-empty string.');
     }
     if (body.name.trim().length > 100) {
-      throw httpError(400, 'name must be at most 100 characters.');
+      throw httpError(400, 'Office name must be at most 100 characters.');
     }
     out.name = body.name.trim();
   }
 
   if (!isUpdate || body.lat !== undefined) {
-    const lat = finiteNumber(body.lat, 'lat');
-    if (lat < -90 || lat > 90) throw httpError(400, 'lat must be between -90 and 90.');
+    const lat = finiteNumber(body.lat, 'Latitude');
+    if (lat < -90 || lat > 90) throw httpError(400, 'Latitude must be between -90 and 90.');
     out.lat = lat;
   }
 
   if (!isUpdate || body.lng !== undefined) {
-    const lng = finiteNumber(body.lng, 'lng');
-    if (lng < -180 || lng > 180) throw httpError(400, 'lng must be between -180 and 180.');
+    const lng = finiteNumber(body.lng, 'Longitude');
+    if (lng < -180 || lng > 180) throw httpError(400, 'Longitude must be between -180 and 180.');
     out.lng = lng;
   }
 
+  if (out.lat !== undefined && out.lng !== undefined) {
+    if (out.lat === 0 && out.lng === 0) {
+      throw httpError(400, 'Latitude and longitude cannot both be 0.');
+    }
+  }
+
   if (!isUpdate || body.radius_m !== undefined) {
-    const radius = finiteNumber(body.radius_m != null ? body.radius_m : 150, 'radius_m');
-    if (radius < 20 || radius > 2000) throw httpError(400, 'radius_m must be between 20 and 2000.');
+    const radius = finiteNumber(body.radius_m != null ? body.radius_m : 150, 'Radius');
+    if (radius < 20 || radius > 2000) throw httpError(400, 'Radius must be between 20 and 2000 meters.');
     out.radius_m = Math.round(radius);
   }
 
   if (!isUpdate || body.accuracy_max_m !== undefined) {
-    const acc = finiteNumber(body.accuracy_max_m != null ? body.accuracy_max_m : 50, 'accuracy_max_m');
-    if (acc < 10 || acc > 200) throw httpError(400, 'accuracy_max_m must be between 10 and 200.');
+    const acc = finiteNumber(body.accuracy_max_m != null ? body.accuracy_max_m : 50, 'Maximum accuracy');
+    if (acc < 10 || acc > 200) throw httpError(400, 'Maximum accuracy must be between 10 and 200 meters.');
     out.accuracy_max_m = Math.round(acc);
   }
 
   if (body.outside_tolerance_minutes !== undefined) {
-    const tol = finiteNumber(body.outside_tolerance_minutes, 'outside_tolerance_minutes');
-    if (tol < 1 || tol > 120) throw httpError(400, 'outside_tolerance_minutes must be between 1 and 120.');
+    const tol = finiteNumber(body.outside_tolerance_minutes, 'Outside tolerance');
+    if (tol < 1 || tol > 120) throw httpError(400, 'Outside tolerance must be between 1 and 120 minutes.');
     out.outside_tolerance_minutes = Math.round(tol);
   }
 
   if (body.short_outing_allowance_minutes !== undefined) {
-    const allow = finiteNumber(body.short_outing_allowance_minutes, 'short_outing_allowance_minutes');
-    if (allow < 0 || allow > 240) throw httpError(400, 'short_outing_allowance_minutes must be between 0 and 240.');
+    const allow = finiteNumber(body.short_outing_allowance_minutes, 'Short outing allowance');
+    if (allow < 0 || allow > 240) throw httpError(400, 'Short outing allowance must be between 0 and 240 minutes.');
     out.short_outing_allowance_minutes = Math.round(allow);
   }
 
   if (body.heartbeat_seconds !== undefined) {
-    const hb = finiteNumber(body.heartbeat_seconds, 'heartbeat_seconds');
-    if (hb < 10 || hb > 300) throw httpError(400, 'heartbeat_seconds must be between 10 and 300.');
+    const hb = finiteNumber(body.heartbeat_seconds, 'Heartbeat interval');
+    if (hb < 10 || hb > 300) throw httpError(400, 'Heartbeat interval must be between 10 and 300 seconds.');
     out.heartbeat_seconds = Math.round(hb);
   }
 
   if (body.reverify_count !== undefined) {
-    const rev = finiteNumber(body.reverify_count, 'reverify_count');
-    if (rev < 0 || rev > 10) throw httpError(400, 'reverify_count must be between 0 and 10.');
+    const rev = finiteNumber(body.reverify_count, 'Reverify count');
+    if (rev < 0 || rev > 10) throw httpError(400, 'Reverify count must be between 0 and 10.');
     out.reverify_count = Math.round(rev);
   }
 
   if (body.grace_minutes !== undefined) {
-    const grace = finiteNumber(body.grace_minutes, 'grace_minutes');
-    if (grace < 0 || grace > 60) throw httpError(400, 'grace_minutes must be between 0 and 60.');
+    const grace = finiteNumber(body.grace_minutes, 'Grace minutes');
+    if (grace < 0 || grace > 60) throw httpError(400, 'Grace minutes must be between 0 and 60.');
     out.grace_minutes = Math.round(grace);
   }
 
   if (body.shift_start !== undefined) {
     if (!/^\d{2}:\d{2}(:\d{2})?$/.test(String(body.shift_start))) {
-      throw httpError(400, 'shift_start must be HH:mm or HH:mm:ss.');
+      throw httpError(400, 'Shift start must be HH:mm or HH:mm:ss.');
     }
     out.shift_start = String(body.shift_start).length === 5 ? `${body.shift_start}:00` : String(body.shift_start);
   }
 
   if (body.shift_end !== undefined) {
     if (!/^\d{2}:\d{2}(:\d{2})?$/.test(String(body.shift_end))) {
-      throw httpError(400, 'shift_end must be HH:mm or HH:mm:ss.');
+      throw httpError(400, 'Shift end must be HH:mm or HH:mm:ss.');
     }
     out.shift_end = String(body.shift_end).length === 5 ? `${body.shift_end}:00` : String(body.shift_end);
   }
@@ -178,6 +199,7 @@ module.exports = {
   httpError,
   finiteNumber,
   assertLatLngAccuracy,
+  assertDescriptor,
   assertDescriptors,
   clientIp,
   parseMonth,

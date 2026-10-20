@@ -11,7 +11,7 @@ function parseOffice(row) {
       // keep as string or null
     }
   }
-  return {
+  const parsed = {
     ...row,
     lat: row.lat != null ? Number(row.lat) : null,
     lng: row.lng != null ? Number(row.lng) : null,
@@ -25,6 +25,10 @@ function parseOffice(row) {
     reverify_count: Number(row.reverify_count),
     ip_allowlist: ipAllowlist,
   };
+  if (row.employeeCount !== undefined) {
+    parsed.employeeCount = Number(row.employeeCount) || 0;
+  }
+  return parsed;
 }
 
 const SELECT = `
@@ -47,7 +51,18 @@ const AttendanceOfficeModel = {
 
   async findAll() {
     const [rows] = await pool.query(
-      `SELECT ${SELECT} FROM attendance_offices ORDER BY id ASC`
+      `SELECT
+         o.id, o.name, o.lat, o.lng, o.radius_m, o.accuracy_max_m, o.ip_allowlist, o.require_both,
+         TIME_FORMAT(o.shift_start, '%H:%i:%s') AS shift_start,
+         TIME_FORMAT(o.shift_end, '%H:%i:%s') AS shift_end,
+         o.grace_minutes, o.outside_tolerance_minutes, o.short_outing_allowance_minutes,
+         o.heartbeat_seconds, o.reverify_count,
+         ${sqlUtc('o.created_at')}, ${sqlUtc('o.updated_at')},
+         COUNT(p.user_id) AS employeeCount
+       FROM attendance_offices o
+       LEFT JOIN attendance_profiles p ON p.office_id = o.id
+       GROUP BY o.id
+       ORDER BY o.id ASC`
     );
     return rows.map(parseOffice);
   },
