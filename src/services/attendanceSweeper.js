@@ -12,6 +12,7 @@ const attendanceBus = require('./attendanceBus');
 const {
   applyPresenceTransition,
   recordAttempt,
+  resolveOfficeForUser,
 } = require('./attendanceGate');
 
 const AttendancePresenceModel = require('../models/attendancePresence.model');
@@ -109,8 +110,14 @@ async function performSweep(now = new Date()) {
   }
 
   for (const record of records) {
-    const shiftEndHms = record.shift_end || '18:30:00';
-    const shiftStartHms = record.shift_start || '09:30:00';
+    let fallbackOffice = null;
+    if (!record.office_id || !record.office_name) {
+      try {
+        fallbackOffice = await resolveOfficeForUser(record.user_id);
+      } catch {}
+    }
+    const shiftEndHms = record.shift_end || fallbackOffice?.shift_end || '18:30:00';
+    const shiftStartHms = record.shift_start || fallbackOffice?.shift_start || '09:30:00';
     const shiftEndUtc = istDateTimeToUtc(record.attendance_date, shiftEndHms);
     const shiftEndPlus15 = new Date(shiftEndUtc.getTime() + 15 * 60000);
 
@@ -131,8 +138,12 @@ async function performSweep(now = new Date()) {
         checkInAt: record.check_in_at,
         closeTime,
         intervals,
-        toleranceMinutes: record.outside_tolerance_minutes != null ? record.outside_tolerance_minutes : 10,
-        allowanceMinutes: record.short_outing_allowance_minutes != null ? record.short_outing_allowance_minutes : 30,
+        toleranceMinutes: record.outside_tolerance_minutes != null
+          ? record.outside_tolerance_minutes
+          : (fallbackOffice?.outside_tolerance_minutes != null ? fallbackOffice.outside_tolerance_minutes : 10),
+        allowanceMinutes: record.short_outing_allowance_minutes != null
+          ? record.short_outing_allowance_minutes
+          : (fallbackOffice?.short_outing_allowance_minutes != null ? fallbackOffice.short_outing_allowance_minutes : 30),
       });
 
       const [res] = await pool.query(
@@ -167,7 +178,9 @@ async function performSweep(now = new Date()) {
     // ── 3a. NO SIGNAL ────────────────────────────────────────────────────────
     let presence = presenceMap.get(record.id);
     if (presence && presence.state === 'INSIDE') {
-      const heartbeatIntervalSec = record.heartbeat_seconds != null ? record.heartbeat_seconds : 60;
+      const heartbeatIntervalSec = record.heartbeat_seconds != null
+        ? record.heartbeat_seconds
+        : (fallbackOffice?.heartbeat_seconds != null ? fallbackOffice.heartbeat_seconds : 60);
       const noSignalThresholdMs = 2 * heartbeatIntervalSec * 1000;
       const refTime = presence.last_heartbeat_at || record.check_in_at;
       const refTimeDate = fromUtcDateTime(refTime);
@@ -199,7 +212,9 @@ async function performSweep(now = new Date()) {
 
     // ── 3b. TOLERANCE ALERT ──────────────────────────────────────────────────
     if (presence && (presence.state === 'OUTSIDE' || presence.state === 'UNKNOWN')) {
-      const toleranceMinutes = record.outside_tolerance_minutes != null ? record.outside_tolerance_minutes : 10;
+      const toleranceMinutes = record.outside_tolerance_minutes != null
+        ? record.outside_tolerance_minutes
+        : (fallbackOffice?.outside_tolerance_minutes != null ? fallbackOffice.outside_tolerance_minutes : 10);
       const outsideSince = presence.outside_since || presence.last_inside_at || record.check_in_at;
       const outsideSinceDate = fromUtcDateTime(outsideSince);
       const outsideMs = outsideSinceDate ? (now.getTime() - outsideSinceDate.getTime()) : 0;
@@ -273,7 +288,9 @@ async function performSweep(now = new Date()) {
     }
 
     // 2. Schedule remaining tasks if fewer than N exist today
-    const targetCount = Number(record.reverify_count) || 0;
+    const targetCount = record.reverify_count != null
+      ? Number(record.reverify_count)
+      : (fallbackOffice?.reverify_count != null ? Number(fallbackOffice.reverify_count) : 0);
     if (targetCount > 0 && tasks.length < targetCount) {
       const shiftStartUtc = istDateTimeToUtc(record.attendance_date, shiftStartHms);
       const shiftEndUtc = istDateTimeToUtc(record.attendance_date, shiftEndHms);
@@ -380,4 +397,5 @@ module.exports = {
   start,
   stop,
   sweepOnce,
+  performSweep,
 };

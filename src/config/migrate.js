@@ -271,8 +271,14 @@ const migrate = async () => {
             shift_end        TIME         DEFAULT NULL,
             face_template    VARBINARY(1024) DEFAULT NULL,
             face_enrolled_at DATETIME     DEFAULT NULL,
+            enrol_source     ENUM('LIVE','PHOTO') DEFAULT NULL,
+            photo_enc        MEDIUMBLOB   DEFAULT NULL,
+            photo_mime       VARCHAR(20)  DEFAULT NULL,
+            photo_uploaded_at DATETIME    DEFAULT NULL,
             consent_at       DATETIME     DEFAULT NULL,
             consent_version  VARCHAR(32)  DEFAULT NULL,
+            admin_consent_at DATETIME     DEFAULT NULL,
+            admin_consent_by VARCHAR(50)  DEFAULT NULL,
             created_at       DATETIME     NOT NULL,
             updated_at       DATETIME     NOT NULL,
             INDEX idx_att_profiles_office (office_id)
@@ -355,6 +361,8 @@ const migrate = async () => {
             issued_at   DATETIME     NOT NULL,
             expires_at  DATETIME     NOT NULL,
             used_at     DATETIME     DEFAULT NULL,
+            issued_lat  DECIMAL(10,7) DEFAULT NULL,
+            issued_lng  DECIMAL(10,7) DEFAULT NULL,
             INDEX idx_att_challenges_user (user_id, purpose, issued_at)
           ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         `,
@@ -525,6 +533,54 @@ const migrate = async () => {
       }
     } catch (err) {
       console.warn('⚠️  attendance_reverify_tasks: could not modify status column —', err.message);
+    }
+
+    // ── Guarded upgrade: add photo and admin consent columns to attendance_profiles if missing ──
+    try {
+      if (await tableExists('attendance_profiles')) {
+        if (!(await columnExists('attendance_profiles', 'enrol_source'))) {
+          await pool.query(`ALTER TABLE attendance_profiles ADD COLUMN enrol_source ENUM('LIVE','PHOTO') NULL AFTER face_enrolled_at`);
+          console.log('✅ attendance_profiles: enrol_source column added');
+        }
+        if (!(await columnExists('attendance_profiles', 'photo_enc'))) {
+          await pool.query(`ALTER TABLE attendance_profiles ADD COLUMN photo_enc MEDIUMBLOB NULL AFTER enrol_source`);
+          console.log('✅ attendance_profiles: photo_enc column added');
+        }
+        if (!(await columnExists('attendance_profiles', 'photo_mime'))) {
+          await pool.query(`ALTER TABLE attendance_profiles ADD COLUMN photo_mime VARCHAR(20) NULL AFTER photo_enc`);
+          console.log('✅ attendance_profiles: photo_mime column added');
+        }
+        if (!(await columnExists('attendance_profiles', 'photo_uploaded_at'))) {
+          await pool.query(`ALTER TABLE attendance_profiles ADD COLUMN photo_uploaded_at DATETIME NULL AFTER photo_mime`);
+          console.log('✅ attendance_profiles: photo_uploaded_at column added');
+        }
+        if (!(await columnExists('attendance_profiles', 'admin_consent_at'))) {
+          await pool.query(`ALTER TABLE attendance_profiles ADD COLUMN admin_consent_at DATETIME NULL AFTER consent_version`);
+          console.log('✅ attendance_profiles: admin_consent_at column added');
+        }
+        if (!(await columnExists('attendance_profiles', 'admin_consent_by'))) {
+          await pool.query(`ALTER TABLE attendance_profiles ADD COLUMN admin_consent_by VARCHAR(50) NULL AFTER admin_consent_at`);
+          console.log('✅ attendance_profiles: admin_consent_by column added');
+        }
+      }
+    } catch (err) {
+      console.warn('⚠️  attendance_profiles: could not add photo/consent columns —', err.message);
+    }
+
+    // ── Guarded upgrade: add issued_lat and issued_lng to attendance_challenges if missing ──
+    try {
+      if (await tableExists('attendance_challenges')) {
+        if (!(await columnExists('attendance_challenges', 'issued_lat'))) {
+          await pool.query(`ALTER TABLE attendance_challenges ADD COLUMN issued_lat DECIMAL(10,7) NULL AFTER used_at`);
+          console.log('✅ attendance_challenges: issued_lat column added');
+        }
+        if (!(await columnExists('attendance_challenges', 'issued_lng'))) {
+          await pool.query(`ALTER TABLE attendance_challenges ADD COLUMN issued_lng DECIMAL(10,7) NULL AFTER issued_lat`);
+          console.log('✅ attendance_challenges: issued_lng column added');
+        }
+      }
+    } catch (err) {
+      console.warn('⚠️  attendance_challenges: could not add issued coordinates columns —', err.message);
     }
 
     console.log('\n🎉 All migrations completed successfully.');
