@@ -12,17 +12,19 @@ function finiteNumber(value, name) {
   return n;
 }
 
-function assertLatLngAccuracy(body) {
-  const lat = finiteNumber(body.lat, 'Latitude');
-  const lng = finiteNumber(body.lng, 'Longitude');
-  const accuracy = finiteNumber(body.accuracy, 'Accuracy');
+function assertLatLngAccuracy(body = {}) {
+  const lat = finiteNumber(body?.lat, 'Latitude');
+  const lng = finiteNumber(body?.lng, 'Longitude');
+  const accuracy = finiteNumber(body?.accuracy, 'Accuracy');
   if (lat < -90 || lat > 90) throw httpError(400, 'Latitude must be between -90 and 90.');
   if (lng < -180 || lng > 180) throw httpError(400, 'Longitude must be between -180 and 180.');
   if (accuracy <= 0) throw httpError(400, 'Accuracy must be greater than 0.');
   if (lat === 0 && lng === 0) throw httpError(400, 'Latitude and longitude cannot both be 0.');
 
+  const requireFixTimestamp = process.env.REQUIRE_FIX_TIMESTAMP === 'true';
+
   let fixTimestamp = null;
-  if (body.fixTimestamp !== undefined && body.fixTimestamp !== null) {
+  if (body?.fixTimestamp !== undefined && body?.fixTimestamp !== null && body?.fixTimestamp !== '') {
     const ts = typeof body.fixTimestamp === 'number' ? body.fixTimestamp : Number(body.fixTimestamp);
     if (!Number.isFinite(ts)) {
       throw httpError(400, 'Location is out of date. Please refresh your location.');
@@ -32,6 +34,8 @@ function assertLatLngAccuracy(body) {
       throw httpError(400, 'Location is out of date. Please refresh your location.');
     }
     fixTimestamp = ts;
+  } else if (requireFixTimestamp) {
+    throw httpError(400, 'Location is out of date. Please refresh your location.');
   }
 
   return { lat, lng, accuracy, fixTimestamp };

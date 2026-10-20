@@ -158,7 +158,9 @@ Errors use HTTP status codes and provide error details:
   - `lat`: Finite number between `-90` and `90` (cannot be 0 if `lng` is also 0).
   - `lng`: Finite number between `-180` and `180` (cannot be 0 if `lat` is also 0).
   - `accuracy`: Finite positive number $> 0$ and $\le$ office `accuracy_max_m` (default 50m).
-  - `fixTimestamp`: (Optional) Epoch timestamp in milliseconds. Must be within the last 60 seconds (rejects older than 60s or future > 10s).
+  - `fixTimestamp`: Epoch timestamp in milliseconds. Must be within the last 60 seconds (rejects older than 60s or future > 10s). Optional by default; when `REQUIRE_FIX_TIMESTAMP=true` is set, missing `fixTimestamp` is rejected with `400 "Location is out of date. Please refresh your location."`.
+- **Position Persistence**:
+  - The challenge coordinates (`lat` and `lng`) are persisted directly into the database (`attendance_challenges.issued_lat` and `issued_lng`) across server restarts and multiple backend instances.
 - **Success Response (200)**:
   ```json
   {
@@ -205,8 +207,9 @@ Errors use HTTP status codes and provide error details:
   - Replay check: pairwise distance must exceed `FACE_REPLAY_EPSILON` (default `0.004`).
   - Single-use challenge: challenge is marked used atomically; cannot be reused even on failure.
   - Timing: Challenge response must arrive between 2s and 45s after issuance.
-  - Distance check: Distance between challenge fix and check-in fix must be $\le$ 500m (rejects location spoofing where challenge is requested at the office and check-in submitted from home).
-  - Anti-replay `fixTimestamp`: (Optional) Epoch timestamp in ms within the last 60 seconds.
+  - Distance check: Distance between challenge fix and check-in fix must be $\le$ 500m (read from `attendance_challenges.issued_lat` and `issued_lng`). Rejects location spoofing where challenge is requested at the office and check-in submitted from elsewhere.
+  - Position Guard: If the challenge row has no stored position (NULL), the check-in is rejected immediately with `400 "Challenge is not valid. Please request a new one."`.
+  - Anti-replay `fixTimestamp`: Epoch timestamp in ms within the last 60 seconds (mandatory if `REQUIRE_FIX_TIMESTAMP=true`).
   - Match: Euclidean distance against logged-in user's enrolled template must be $\le$ `FACE_MATCH_THRESHOLD` (default `0.5`).
 - **Success Response (200)**:
   ```json
@@ -223,6 +226,7 @@ Errors use HTTP status codes and provide error details:
   ```
 - **Error Responses**:
   - `400 Bad Request`: `{"success":false,"message":"Location verification failed: You are outside the authorized office premises."}` (distance > 500m from challenge fix or outside office)
+  - `400 Bad Request`: `{"success":false,"message":"Challenge is not valid. Please request a new one."}` (challenge row lacks stored position)
   - `400 Bad Request`: `{"success":false,"message":"GPS signal is too weak. Move near a window or an open area and try again."}` (poor accuracy)
   - `400 Bad Request`: `{"success":false,"message":"Location is out of date. Please refresh your location."}` (stale fixTimestamp)
   - `400 Bad Request`: `{"success":false,"message":"Challenge has already been used."}`
@@ -617,6 +621,7 @@ Errors use HTTP status codes and provide error details:
     "photoBase64": "data:image/jpeg;base64,/9j/4AAQSkZJRg...",
     "mimeType": "image/jpeg",
     "consentAttested": true,
+    "replaceTemplate": false,
     "descriptors": [
       [0.051, -0.023, ...],
       [0.053, -0.021, ...]
@@ -629,24 +634,31 @@ Errors use HTTP status codes and provide error details:
   - `mimeType` must be `'image/jpeg'` or `'image/png'`, verified against magic bytes (`400 Invalid photo format. Only JPEG and PNG are allowed.`).
   - Maximum photo size: **60 KB** after base64 decode (`400 Photo is too large, maximum 60 KB after compression`).
   - **Descriptor Trust**: Client-side extracted descriptors (from tfjs/face-api in browser) are validated for shape (128-d numbers), averaged, normalized to unit L2 length, and trusted directly as the template without re-running facial extraction on the server.
+  - **Live Template Downgrade Protection**:
+    - If employee already has a template with `enrol_source = 'LIVE'`:
+      - When `replaceTemplate: true` is sent: replaces existing face template and updates `enrol_source = 'PHOTO'` (`templateUpdated: true`).
+      - When `replaceTemplate` is omitted or `false`: stores new photo and updates `photo_uploaded_at`, but preserves existing `LIVE` template and `enrol_source = 'LIVE'` (`templateUpdated: false`).
+    - When no template exists or existing template was `PHOTO`: stores both photo and template (`templateUpdated: true`).
   - **Storage & Encryption**: Photo binary is encrypted at rest using AES-256-GCM (`encryptBuffer` with `ATTENDANCE_FACE_KEY` / `JWT_SECRET`). Template is encrypted and stored in `face_template`.
   - **Audit Log**: Audit entry recorded (`enrol_photo`) strictly excluding photo bytes and descriptors.
 - **Success Response (200)**:
   ```json
   {
     "success": true,
-    "message": "Employee photo enrolled successfully",
+    "message": "Photo and face template enrolled successfully",
     "data": {
       "userId": "tb001",
       "enrolledAt": "2026-10-20T06:33:57.040Z",
       "enrolSource": "PHOTO",
-      "hasPhoto": true
+      "hasPhoto": true,
+      "templateUpdated": true
     }
   }
   ```
 
 #### GET `/api/attendance/admin/employees/:userId/photo`
 - **Auth**: Admin (`protect`)
+- **Audit Logging**: Writes an `attendance_audit_log` row (`action: 'view_photo'`, `entity_type: 'employee'`, `entity_id: userId`, `after_json: {}`) before sending the image.
 - **Response**: Decrypted binary image with security headers (`Cache-Control: private, no-store`, `X-Content-Type-Options: nosniff`, `Content-Type: image/jpeg` or `image/png`).
 - **Error Responses**:
   - `404 Not Found`: `{"success":false,"message":"Photo not found for this employee."}`

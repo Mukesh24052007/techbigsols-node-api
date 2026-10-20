@@ -91,6 +91,22 @@ const AttendanceProfileModel = {
     );
   },
 
+  async savePhotoOnly(userId, { photoEnc, photoMime, adminConsentBy, now }) {
+    await pool.query(
+      `INSERT INTO attendance_profiles
+        (user_id, photo_enc, photo_mime, photo_uploaded_at, admin_consent_at, admin_consent_by, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         photo_enc = VALUES(photo_enc),
+         photo_mime = VALUES(photo_mime),
+         photo_uploaded_at = VALUES(photo_uploaded_at),
+         admin_consent_at = VALUES(admin_consent_at),
+         admin_consent_by = VALUES(admin_consent_by),
+         updated_at = VALUES(updated_at)`,
+      [userId, photoEnc, photoMime, now, now, adminConsentBy, now, now]
+    );
+  },
+
   async upsertConsent(userId, version) {
     const now = toUtcDateTime();
     await pool.query(

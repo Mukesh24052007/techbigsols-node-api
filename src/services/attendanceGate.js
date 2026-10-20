@@ -22,8 +22,6 @@ const CHALLENGE_TTL_MS = 60 * 1000;
 const CHALLENGE_MIN_MS = 2 * 1000;
 const CHALLENGE_MAX_MS = 45 * 1000;
 
-const challengeCoords = new Map();
-
 async function resolveOfficeForUser(userId) {
   const profile = await AttendanceProfileModel.ensureProfile(userId);
   if (profile?.office_id) {
@@ -127,16 +125,9 @@ async function createChallenge({ userId, purpose, lat = null, lng = null, issued
     action,
     issuedAt: issued,
     expiresAt: expires,
+    lat: lat !== null ? Number(lat) : null,
+    lng: lng !== null ? Number(lng) : null,
   });
-  if (lat != null && lng != null) {
-    challengeCoords.set(id, { lat: Number(lat), lng: Number(lng), exp: issuedAt.getTime() + CHALLENGE_TTL_MS });
-  }
-  if (challengeCoords.size > 200) {
-    const nowMs = Date.now();
-    for (const [k, v] of challengeCoords.entries()) {
-      if (v.exp < nowMs) challengeCoords.delete(k);
-    }
-  }
   return { challengeId: id, action, expiresAt: new Date(issuedAt.getTime() + CHALLENGE_TTL_MS).toISOString() };
 }
 
@@ -168,9 +159,12 @@ async function loadAndValidateChallenge({ challengeId, userId, purpose, lat = nu
     throw httpError(400, 'Liveness capture took too long. Request a new challenge.');
   }
 
-  if (lat != null && lng != null && challengeCoords.has(challengeId)) {
-    const saved = challengeCoords.get(challengeId);
-    const dist = haversineMetres(saved.lat, saved.lng, Number(lat), Number(lng));
+  if (row.issued_lat === null || row.issued_lng === null || row.issued_lat === undefined || row.issued_lng === undefined) {
+    throw httpError(400, 'Challenge is not valid. Please request a new one.');
+  }
+
+  if (lat != null && lng != null) {
+    const dist = haversineMetres(Number(row.issued_lat), Number(row.issued_lng), Number(lat), Number(lng));
     if (dist > 500) {
       throw httpError(400, 'Location verification failed: You are outside the authorized office premises.');
     }

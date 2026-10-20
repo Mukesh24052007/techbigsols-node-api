@@ -22,6 +22,7 @@ const bcrypt = require('bcryptjs');
 const app = require('../src/app');
 const { pool } = require('../src/config/db');
 const { toUtcDateTime, istCalendarDate } = require('../src/utils/time');
+const { encryptEmbedding } = require('../src/utils/crypto');
 
 // ── Environment Guard ────────────────────────────────────────────────────────
 const dbHost = process.env.DB_HOST || 'localhost';
@@ -339,6 +340,20 @@ async function runTests() {
         !afterJsonStr.includes('template');
 
       record('10. Audit log row for enrol_photo contains no photo or descriptor data', hasNoPhotoData, afterJsonStr);
+
+      // 10b. Audit log row for view_photo written on GET photo
+      await api(`/api/attendance/admin/employees/${FIXTURE_USER}/photo`, {
+        method: 'GET',
+        token: adminToken,
+      });
+
+      const [viewLogs] = await pool.query(
+        `SELECT * FROM attendance_audit_log WHERE entity_type = 'employee' AND entity_id = ? AND action = 'view_photo' ORDER BY id DESC LIMIT 1`,
+        [FIXTURE_USER]
+      );
+      const viewLog = viewLogs[0];
+      const viewPass = Boolean(viewLog && viewLog.actor_admin_id === FIXTURE_ADMIN_ID);
+      record('10b. Audit log row for view_photo written on GET photo', viewPass);
     }
 
     // 11. No JSON response leaks photo data or 'photo_enc'
@@ -436,6 +451,71 @@ async function runTests() {
         emp.faceEnrolled === false;
 
       record('14. DELETE face removes template AND photo', pass);
+    }
+
+    // 15 & 16. LIVE template safeguard
+    {
+      const liveDesc = generateDescriptor(99);
+      const encLive = encryptEmbedding(liveDesc);
+      await pool.query(
+        `UPDATE attendance_profiles SET face_template = ?, face_enrolled_at = NOW(), enrol_source = 'LIVE' WHERE user_id = ?`,
+        [encLive, FIXTURE_USER]
+      );
+
+      // Call POST photo with replaceTemplate omitted
+      const resPreserve = await api(`/api/attendance/admin/employees/${FIXTURE_USER}/photo`, {
+        method: 'POST',
+        token: adminToken,
+        body: {
+          photo: validJpegBytes.toString('base64'),
+          descriptors: [validDescriptor],
+          consentAttested: true,
+        },
+      });
+
+      const passPreserveResponse =
+        resPreserve.status === 200 &&
+        resPreserve.body?.data?.templateUpdated === false &&
+        resPreserve.body?.data?.enrolSource === 'LIVE' &&
+        resPreserve.body?.data?.hasPhoto === true;
+
+      const [profRowPreserve] = await pool.query(
+        `SELECT face_template, enrol_source, photo_enc FROM attendance_profiles WHERE user_id = ?`,
+        [FIXTURE_USER]
+      );
+      const passPreserveDb =
+        profRowPreserve[0]?.enrol_source === 'LIVE' &&
+        profRowPreserve[0]?.face_template.equals(encLive) &&
+        Boolean(profRowPreserve[0]?.photo_enc);
+
+      record('15. Photo upload preserves LIVE template when replaceTemplate omitted (templateUpdated=false)', passPreserveResponse && passPreserveDb);
+
+      // Call POST photo with replaceTemplate: true
+      const resReplace = await api(`/api/attendance/admin/employees/${FIXTURE_USER}/photo`, {
+        method: 'POST',
+        token: adminToken,
+        body: {
+          photo: validPngBytes.toString('base64'),
+          descriptors: [validDescriptor],
+          consentAttested: true,
+          replaceTemplate: true,
+        },
+      });
+
+      const passReplaceResponse =
+        resReplace.status === 200 &&
+        resReplace.body?.data?.templateUpdated === true &&
+        resReplace.body?.data?.enrolSource === 'PHOTO';
+
+      const [profRowReplace] = await pool.query(
+        `SELECT face_template, enrol_source FROM attendance_profiles WHERE user_id = ?`,
+        [FIXTURE_USER]
+      );
+      const passReplaceDb =
+        profRowReplace[0]?.enrol_source === 'PHOTO' &&
+        !profRowReplace[0]?.face_template.equals(encLive);
+
+      record('16. Photo upload replaces LIVE template when replaceTemplate: true (templateUpdated=true)', passReplaceResponse && passReplaceDb);
     }
 
   } catch (err) {

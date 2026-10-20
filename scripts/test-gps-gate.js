@@ -507,6 +507,72 @@ async function runTests() {
         checkInDistant.status === 400,
         `Status: ${checkInDistant.status}, Msg: ${checkInDistant.body?.message}`
       );
+
+      // 11b. Challenge with NULL coordinates rejected with exact 400 message
+      await pool.query('DELETE FROM attendance_attempts WHERE user_id = ?', [FIXTURE_USER_ASSIGNED]);
+      const chalNullRes = await api('/api/attendance/challenge', {
+        method: 'POST',
+        token: assignedToken,
+        body: { lat: OFFICE_LAT, lng: OFFICE_LNG, accuracy: 20, purpose: 'checkin' },
+      });
+      const chalNullId = chalNullRes.body?.data?.challengeId;
+      assert(chalNullId, 'Expected challengeId');
+
+      await pool.query('UPDATE attendance_challenges SET issued_lat = NULL, issued_lng = NULL WHERE id = ?', [chalNullId]);
+      await new Promise((r) => setTimeout(r, 2100));
+
+      const checkInNull = await api('/api/attendance/check-in', {
+        method: 'POST',
+        token: assignedToken,
+        body: {
+          challengeId: chalNullId,
+          lat: OFFICE_LAT,
+          lng: OFFICE_LNG,
+          accuracy: 20,
+          descriptors: [d1, d2, d3],
+        },
+      });
+
+      const passNull =
+        checkInNull.status === 400 &&
+        checkInNull.body?.message === 'Challenge is not valid. Please request a new one.';
+
+      record('F3.5b. Challenge with NULL coordinates rejected with exact 400 message', passNull, checkInNull.body?.message);
+
+      // 11c. Simulate "another instance" by clearing require cache between challenge and check-in
+      await pool.query('DELETE FROM attendance_attempts WHERE user_id = ?', [FIXTURE_USER_ASSIGNED]);
+      const chalInstRes = await api('/api/attendance/challenge', {
+        method: 'POST',
+        token: assignedToken,
+        body: { lat: OFFICE_LAT, lng: OFFICE_LNG, accuracy: 20, purpose: 'checkin' },
+      });
+      const chalInstId = chalInstRes.body?.data?.challengeId;
+      assert(chalInstId, 'Expected challengeId');
+
+      // Clear module cache
+      const gatePath = require.resolve('../src/services/attendanceGate');
+      delete require.cache[gatePath];
+      require('../src/services/attendanceGate');
+
+      await new Promise((r) => setTimeout(r, 2100));
+
+      const checkInDistantInst = await api('/api/attendance/check-in', {
+        method: 'POST',
+        token: assignedToken,
+        body: {
+          challengeId: chalInstId,
+          lat: distantLat,
+          lng: OFFICE_LNG,
+          accuracy: 20,
+          descriptors: [d1, d2, d3],
+        },
+      });
+
+      const passInst =
+        checkInDistantInst.status === 400 &&
+        checkInDistantInst.body?.message === 'Location verification failed: You are outside the authorized office premises.';
+
+      record('F3.5c. Multi-instance / cache-cleared check-in still enforces DB distance check (400)', passInst);
     }
 
     // 12. Valid check-in within 500m succeeds and marks PRESENT
@@ -546,6 +612,60 @@ async function runTests() {
         (checkInRes.body?.data?.status === 'PRESENT' || checkInRes.body?.data?.status === 'LATE');
 
       record('F3.6. Valid check-in with consistent position and fixTimestamp succeeds', pass, `Status: ${checkInRes.body?.data?.status}`);
+    }
+
+    // 13. REQUIRE_FIX_TIMESTAMP env flag tests (default false vs true)
+    {
+      const expectedMsg = 'Location is out of date. Please refresh your location.';
+
+      // Setting 1: REQUIRE_FIX_TIMESTAMP = 'false' (default)
+      process.env.REQUIRE_FIX_TIMESTAMP = 'false';
+      await pool.query('DELETE FROM attendance_attempts WHERE user_id = ?', [FIXTURE_USER_ASSIGNED]);
+      const resFalse = await api('/api/attendance/challenge', {
+        method: 'POST',
+        token: assignedToken,
+        body: { lat: OFFICE_LAT, lng: OFFICE_LNG, accuracy: 20, purpose: 'checkin' },
+      });
+      const passFalse = resFalse.status === 200;
+
+      // Setting 2: REQUIRE_FIX_TIMESTAMP = 'true'
+      process.env.REQUIRE_FIX_TIMESTAMP = 'true';
+      await pool.query('DELETE FROM attendance_attempts WHERE user_id = ?', [FIXTURE_USER_ASSIGNED]);
+
+      const resTrueChal = await api('/api/attendance/challenge', {
+        method: 'POST',
+        token: assignedToken,
+        body: { lat: OFFICE_LAT, lng: OFFICE_LNG, accuracy: 20, purpose: 'checkin' },
+      });
+
+      const resTrueCheckIn = await api('/api/attendance/check-in', {
+        method: 'POST',
+        token: assignedToken,
+        body: { challengeId: 'non-existent', lat: OFFICE_LAT, lng: OFFICE_LNG, accuracy: 20 },
+      });
+
+      const resTrueHeartbeat = await api('/api/attendance/heartbeat', {
+        method: 'POST',
+        token: assignedToken,
+        body: { lat: OFFICE_LAT, lng: OFFICE_LNG, accuracy: 20 },
+      });
+
+      const resTrueReverify = await api('/api/attendance/reverify', {
+        method: 'POST',
+        token: assignedToken,
+        body: { lat: OFFICE_LAT, lng: OFFICE_LNG, accuracy: 20 },
+      });
+
+      // Reset back to default
+      process.env.REQUIRE_FIX_TIMESTAMP = 'false';
+
+      const passTrue =
+        resTrueChal.status === 400 && resTrueChal.body?.message === expectedMsg &&
+        resTrueCheckIn.status === 400 && resTrueCheckIn.body?.message === expectedMsg &&
+        resTrueHeartbeat.status === 400 && resTrueHeartbeat.body?.message === expectedMsg &&
+        resTrueReverify.status === 400 && resTrueReverify.body?.message === expectedMsg;
+
+      record('F3.7. REQUIRE_FIX_TIMESTAMP flag: optional when false, rejected (400) on all 4 routes when true', passFalse && passTrue);
     }
 
   } catch (err) {

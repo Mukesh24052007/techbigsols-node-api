@@ -872,14 +872,34 @@ const AttendanceController = {
       const now = toUtcDateTime();
       const enrolledAt = new Date().toISOString();
 
-      await AttendanceProfileModel.savePhotoAndFace(userId, {
-        photoEnc: encryptedPhoto,
-        photoMime,
-        faceTemplate: encryptedTemplate,
-        enrolSource: 'PHOTO',
-        adminConsentBy: String(req.admin.id),
-        now,
-      });
+      const existingProfile = await AttendanceProfileModel.findByUserId(userId);
+      const isLiveTemplate = Boolean(
+        existingProfile &&
+        (existingProfile.faceEnrolled || existingProfile._hasTemplate) &&
+        (existingProfile.enrolSource === 'LIVE' || existingProfile.enrol_source === 'LIVE')
+      );
+      const replaceTemplate = req.body?.replaceTemplate === true;
+      const shouldUpdateTemplate = !isLiveTemplate || replaceTemplate;
+
+      if (shouldUpdateTemplate) {
+        await AttendanceProfileModel.savePhotoAndFace(userId, {
+          photoEnc: encryptedPhoto,
+          photoMime,
+          faceTemplate: encryptedTemplate,
+          enrolSource: 'PHOTO',
+          adminConsentBy: String(req.admin.id),
+          now,
+        });
+      } else {
+        await AttendanceProfileModel.savePhotoOnly(userId, {
+          photoEnc: encryptedPhoto,
+          photoMime,
+          adminConsentBy: String(req.admin.id),
+          now,
+        });
+      }
+
+      const finalEnrolSource = shouldUpdateTemplate ? 'PHOTO' : (existingProfile?.enrol_source || 'PHOTO');
 
       await AttendanceAuditLogModel.log({
         actorAdminId: req.admin.id,
@@ -888,19 +908,23 @@ const AttendanceController = {
         entityId: userId,
         afterJson: {
           enrolledAt,
-          enrolSource: 'PHOTO',
+          enrolSource: finalEnrolSource,
           hasPhoto: true,
+          templateUpdated: shouldUpdateTemplate,
         },
       });
 
       return res.status(200).json({
         success: true,
-        message: 'Photo and face template enrolled successfully',
+        message: shouldUpdateTemplate
+          ? 'Photo and face template enrolled successfully'
+          : 'Photo uploaded successfully (live template preserved)',
         data: {
           userId,
           enrolledAt,
-          enrolSource: 'PHOTO',
+          enrolSource: finalEnrolSource,
           hasPhoto: true,
+          templateUpdated: shouldUpdateTemplate,
         },
       });
     } catch (err) {
@@ -918,6 +942,14 @@ const AttendanceController = {
       if (!row || !row.photo_enc) {
         throw httpError(404, 'Photo not found for this employee.');
       }
+
+      await AttendanceAuditLogModel.log({
+        actorAdminId: req.admin.id,
+        action: 'view_photo',
+        entityType: 'employee',
+        entityId: userId,
+        afterJson: {},
+      });
 
       const buf = decryptBuffer(row.photo_enc);
       res.setHeader('Content-Type', row.photo_mime || 'image/jpeg');

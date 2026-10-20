@@ -361,6 +361,8 @@ const migrate = async () => {
             issued_at   DATETIME     NOT NULL,
             expires_at  DATETIME     NOT NULL,
             used_at     DATETIME     DEFAULT NULL,
+            issued_lat  DECIMAL(10,7) DEFAULT NULL,
+            issued_lng  DECIMAL(10,7) DEFAULT NULL,
             INDEX idx_att_challenges_user (user_id, purpose, issued_at)
           ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         `,
@@ -563,6 +565,22 @@ const migrate = async () => {
       }
     } catch (err) {
       console.warn('⚠️  attendance_profiles: could not add photo/consent columns —', err.message);
+    }
+
+    // ── Guarded upgrade: add issued_lat and issued_lng to attendance_challenges if missing ──
+    try {
+      if (await tableExists('attendance_challenges')) {
+        if (!(await columnExists('attendance_challenges', 'issued_lat'))) {
+          await pool.query(`ALTER TABLE attendance_challenges ADD COLUMN issued_lat DECIMAL(10,7) NULL AFTER used_at`);
+          console.log('✅ attendance_challenges: issued_lat column added');
+        }
+        if (!(await columnExists('attendance_challenges', 'issued_lng'))) {
+          await pool.query(`ALTER TABLE attendance_challenges ADD COLUMN issued_lng DECIMAL(10,7) NULL AFTER issued_lat`);
+          console.log('✅ attendance_challenges: issued_lng column added');
+        }
+      }
+    } catch (err) {
+      console.warn('⚠️  attendance_challenges: could not add issued coordinates columns —', err.message);
     }
 
     console.log('\n🎉 All migrations completed successfully.');

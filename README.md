@@ -186,6 +186,7 @@ Migrations are strictly additive and idempotent:
    ```bash
    eb setenv FACE_ENC_KEY=$(openssl rand -hex 32) \
               FACE_MATCH_THRESHOLD=0.5 \
+              REQUIRE_FIX_TIMESTAMP=false \
               TRUSTED_PROXY_HOPS=1 \
               ALLOWED_ORIGINS=https://techbigsolutions.in,https://www.techbigsolutions.in
    ```
