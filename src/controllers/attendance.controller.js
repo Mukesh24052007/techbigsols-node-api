@@ -1286,7 +1286,7 @@ const AttendanceController = {
            ) AS pending_reverify_id
          FROM site_users u
          LEFT JOIN attendance_profiles prof ON prof.user_id = u.user_id
-         LEFT JOIN attendance_offices o ON o.id = prof.office_id
+         LEFT JOIN attendance_offices o ON o.id = COALESCE(prof.office_id, (SELECT CASE WHEN COUNT(*) = 1 THEN MIN(id) ELSE NULL END FROM attendance_offices))
          LEFT JOIN attendance_records r ON r.user_id = u.user_id AND r.attendance_date = ?
          LEFT JOIN attendance_presence p ON p.record_id = r.id
          LEFT JOIN attendance_leaves l ON l.user_id = u.user_id AND l.leave_date = ? AND l.status = 'APPROVED'
@@ -1295,19 +1295,6 @@ const AttendanceController = {
          ORDER BY u.fullname ASC`,
         [today, today]
       );
-
-      // If any employee lacks office settings, resolve using resolveOfficeForUser
-      for (const r of rows) {
-        if (r.outside_tolerance_minutes == null || r.short_outing_allowance_minutes == null) {
-          try {
-            const off = await resolveOfficeForUser(r.employee_id);
-            if (off) {
-              if (r.outside_tolerance_minutes == null) r.outside_tolerance_minutes = off.outside_tolerance_minutes;
-              if (r.short_outing_allowance_minutes == null) r.short_outing_allowance_minutes = off.short_outing_allowance_minutes;
-            }
-          } catch {}
-        }
-      }
 
       // Collect open record IDs for Query 2
       const openRecordIds = rows
