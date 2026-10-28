@@ -80,8 +80,45 @@ function decryptEmbedding(payload) {
   return bufferToFloats(pt);
 }
 
+/**
+ * AES-256-GCM encrypt arbitrary buffer. Returns iv || tag || ciphertext.
+ * @param {Buffer} buffer
+ * @returns {Buffer}
+ */
+function encryptBuffer(buffer) {
+  if (!Buffer.isBuffer(buffer)) {
+    throw httpError(500, 'Invalid buffer to encrypt.');
+  }
+  const key = getFaceKey();
+  const iv = crypto.randomBytes(IV_LEN);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const ciphertext = Buffer.concat([cipher.update(buffer), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return Buffer.concat([iv, tag, ciphertext]);
+}
+
+/**
+ * AES-256-GCM decrypt arbitrary buffer.
+ * @param {Buffer} payload
+ * @returns {Buffer}
+ */
+function decryptBuffer(payload) {
+  const key = getFaceKey();
+  if (!Buffer.isBuffer(payload) || payload.length < IV_LEN + TAG_LEN) {
+    throw httpError(500, 'Stored encrypted payload is corrupt.');
+  }
+  const iv = payload.subarray(0, IV_LEN);
+  const tag = payload.subarray(IV_LEN, IV_LEN + TAG_LEN);
+  const ciphertext = payload.subarray(IV_LEN + TAG_LEN);
+  const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+  decipher.setAuthTag(tag);
+  return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+}
+
 module.exports = {
   encryptEmbedding,
   decryptEmbedding,
+  encryptBuffer,
+  decryptBuffer,
   getFaceKey,
 };

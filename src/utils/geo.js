@@ -58,10 +58,10 @@ function evaluateLocation({ office, lat, lng, accuracy, ip }) {
 
   if (!ipConfigured) {
     if (!accuracyOk) {
-      return { ok: false, reason: `GPS accuracy must be ${accuracyMax} m or better.`, gpsOk, ipOk: false, distanceM };
+      return { ok: false, reason: 'GPS signal is too weak. Move near a window or an open area and try again.', gpsOk, ipOk: false, distanceM };
     }
     if (!inside) {
-      return { ok: false, reason: 'You are outside the office radius.', gpsOk, ipOk: false, distanceM };
+      return { ok: false, reason: 'Location verification failed: You are outside the authorized office premises.', gpsOk, ipOk: false, distanceM };
     }
     return { ok: true, reason: null, gpsOk, ipOk: false, distanceM };
   }
@@ -71,12 +71,18 @@ function evaluateLocation({ office, lat, lng, accuracy, ip }) {
   if (ok) return { ok: true, reason: null, gpsOk, ipOk, distanceM };
 
   if (requireBoth) {
+    if (!accuracyOk) {
+      return { ok: false, reason: 'GPS signal is too weak. Move near a window or an open area and try again.', gpsOk, ipOk, distanceM };
+    }
+    if (!inside) {
+      return { ok: false, reason: 'Location verification failed: You are outside the authorized office premises.', gpsOk, ipOk, distanceM };
+    }
     return { ok: false, reason: 'Office location and allowed network are both required.', gpsOk, ipOk, distanceM };
   }
   if (!accuracyOk && !ipOk) {
-    return { ok: false, reason: `GPS accuracy must be ${accuracyMax} m or better.`, gpsOk, ipOk, distanceM };
+    return { ok: false, reason: 'GPS signal is too weak. Move near a window or an open area and try again.', gpsOk, ipOk, distanceM };
   }
-  return { ok: false, reason: 'You are outside the office radius and not on an allowed network.', gpsOk, ipOk, distanceM };
+  return { ok: false, reason: 'Location verification failed: You are outside the authorized office premises.', gpsOk, ipOk, distanceM };
 }
 
 module.exports = {

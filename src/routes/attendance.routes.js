@@ -22,9 +22,12 @@ router.get('/me/history', employeeGuard, AttendanceController.getHistory);
 router.post('/regularization', employeeGuard, AttendanceController.requestRegularization);
 
 // ── Admin Routes (admin JWT) ───────────────────────────────────────────────
-// Face enrollment
+// Face & Photo enrollment
 router.post('/admin/employees/:userId/face', protect, AttendanceController.adminEnrolFace);
 router.delete('/admin/employees/:userId/face', protect, AttendanceController.adminDeleteFace);
+router.post('/admin/employees/:userId/photo', protect, AttendanceController.adminEnrolPhoto);
+router.get('/admin/employees/:userId/photo', protect, AttendanceController.adminGetPhoto);
+router.delete('/admin/employees/:userId/photo', protect, AttendanceController.adminDeletePhoto);
 
 // Offices CRUD
 router.post('/admin/offices', protect, AttendanceController.adminCreateOffice);

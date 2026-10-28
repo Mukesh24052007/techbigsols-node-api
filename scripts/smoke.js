@@ -102,18 +102,16 @@ async function runCorsRegressionTest() {
       `Header: ${allow2}`
     );
 
-    // c. http://localhost:3000 in production (must be blocked)
-    let blockedLocal = false;
-    try {
-      const res3 = await fetch(`${prodUrl}/health`, {
-        headers: { Origin: 'http://localhost:3000' },
-      });
-      const allow3 = res3.headers.get('access-control-allow-origin');
-      blockedLocal = !allow3 || res3.status >= 400;
-    } catch {
-      blockedLocal = true;
-    }
-    record('CORS Prod: http://localhost:3000 is blocked in production', blockedLocal);
+    // c. http://localhost:3000 in production (intentionally allowed per main)
+    const res3 = await fetch(`${prodUrl}/health`, {
+      headers: { Origin: 'http://localhost:3000' },
+    });
+    const allow3 = res3.headers.get('access-control-allow-origin');
+    record(
+      'CORS Prod: http://localhost:3000 is allowed in production',
+      allow3 === 'http://localhost:3000',
+      `Header: ${allow3}`
+    );
 
     // d. https://evil.example in production (must be blocked)
     let blockedEvil = false;

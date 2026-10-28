@@ -1,6 +1,6 @@
 const crypto = require('crypto');
 const { pool } = require('../config/db');
-const { evaluateLocation } = require('../utils/geo');
+const { evaluateLocation, haversineMetres } = require('../utils/geo');
 const { decryptEmbedding } = require('../utils/crypto');
 const { euclideanDistance, descriptorsIdentical, matchThreshold, minPairwiseDistance, replayEpsilon } = require('../utils/faceMath');
 const { httpError } = require('../utils/attendanceValidate');
@@ -22,15 +22,24 @@ const CHALLENGE_TTL_MS = 60 * 1000;
 const CHALLENGE_MIN_MS = 2 * 1000;
 const CHALLENGE_MAX_MS = 45 * 1000;
 
+async function resolveOfficeForUser(userId) {
+  const profile = await AttendanceProfileModel.ensureProfile(userId);
+  if (profile?.office_id) {
+    const office = await AttendanceOfficeModel.findById(profile.office_id);
+    if (office) {
+      return office;
+    }
+  }
+  const offices = await AttendanceOfficeModel.findAll();
+  if (offices.length === 1) {
+    return offices[0];
+  }
+  throw httpError(400, 'Your office location is not set. Please contact your administrator.');
+}
+
 async function loadProfileAndOffice(userId) {
-  const profile = await AttendanceProfileModel.findByUserId(userId);
-  if (!profile?.office_id) {
-    throw httpError(400, 'No office is assigned to this employee.');
-  }
-  const office = await AttendanceOfficeModel.findById(profile.office_id);
-  if (!office) {
-    throw httpError(400, 'Assigned office was not found.');
-  }
+  const profile = await AttendanceProfileModel.ensureProfile(userId);
+  const office = await resolveOfficeForUser(userId);
   return { profile, office };
 }
 
@@ -104,7 +113,7 @@ function assertLocation(office, lat, lng, accuracy, ip) {
   return result;
 }
 
-async function createChallenge({ userId, purpose, issuedAt = new Date() }) {
+async function createChallenge({ userId, purpose, lat = null, lng = null, issuedAt = new Date() }) {
   const id = crypto.randomUUID();
   const issued = toUtcDateTime(issuedAt);
   const expires = toUtcDateTime(new Date(issuedAt.getTime() + CHALLENGE_TTL_MS));
@@ -116,11 +125,13 @@ async function createChallenge({ userId, purpose, issuedAt = new Date() }) {
     action,
     issuedAt: issued,
     expiresAt: expires,
+    lat: lat !== null ? Number(lat) : null,
+    lng: lng !== null ? Number(lng) : null,
   });
   return { challengeId: id, action, expiresAt: new Date(issuedAt.getTime() + CHALLENGE_TTL_MS).toISOString() };
 }
 
-async function loadAndValidateChallenge({ challengeId, userId, purpose }) {
+async function loadAndValidateChallenge({ challengeId, userId, purpose, lat = null, lng = null }) {
   if (!challengeId || typeof challengeId !== 'string') {
     throw httpError(400, 'challengeId is required.');
   }
@@ -147,6 +158,18 @@ async function loadAndValidateChallenge({ challengeId, userId, purpose }) {
   if (elapsed > CHALLENGE_MAX_MS) {
     throw httpError(400, 'Liveness capture took too long. Request a new challenge.');
   }
+
+  if (row.issued_lat === null || row.issued_lng === null || row.issued_lat === undefined || row.issued_lng === undefined) {
+    throw httpError(400, 'Challenge is not valid. Please request a new one.');
+  }
+
+  if (lat != null && lng != null) {
+    const dist = haversineMetres(Number(row.issued_lat), Number(row.issued_lng), Number(lat), Number(lng));
+    if (dist > 500) {
+      throw httpError(400, 'Location verification failed: You are outside the authorized office premises.');
+    }
+  }
+
   return row;
 }
 
@@ -315,6 +338,7 @@ function officePublicSubset(office) {
 module.exports = {
   ACTIONS,
   CHALLENGE_TTL_MS,
+  resolveOfficeForUser,
   loadProfileAndOffice,
   shiftTimes,
   isLate,
