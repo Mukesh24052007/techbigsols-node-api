@@ -12,4 +12,7 @@ router.post('/logout', SiteAuthController.logout);
 // GET   /api/site-auth/me      — protected (valid site-user JWT required)
 router.get('/me', siteUserProtect, SiteAuthController.me);
 
+// POST  /api/site-auth/change-password — protected (valid site-user JWT required)
+router.post('/change-password', siteUserProtect, SiteAuthController.changePassword);
+
 module.exports = router;

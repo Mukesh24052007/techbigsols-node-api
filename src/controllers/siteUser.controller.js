@@ -40,13 +40,36 @@ const SiteUserController = {
    */
   async create(req, res, next) {
     try {
-      const { fullname, email, password, moduleAccess } = req.body;
+      const {
+        fullname,
+        email,
+        password,
+        moduleAccess,
+        phone,
+        role,
+        department,
+        designation,
+      } = req.body || {};
 
       // --- Validation ---
-      if (!fullname || !email || !password) {
+      if (!fullname || typeof fullname !== 'string' || !fullname.trim()) {
         return res.status(400).json({
           success: false,
-          message: 'fullname, email, and password are required.',
+          message: 'fullname is required.',
+        });
+      }
+
+      if (!email || typeof email !== 'string' || !email.trim()) {
+        return res.status(400).json({
+          success: false,
+          message: 'email is required.',
+        });
+      }
+
+      if (!password || typeof password !== 'string' || password.length < 6) {
+        return res.status(400).json({
+          success: false,
+          message: 'password is required and must be at least 6 characters.',
         });
       }
 
@@ -68,8 +91,9 @@ const SiteUserController = {
         });
       }
 
-      // Check email uniqueness
-      const existing = await SiteUserModel.findByEmail(email);
+      // Check email uniqueness (case-insensitive)
+      const normalizedEmail = email.toLowerCase().trim();
+      const existing = await SiteUserModel.findByEmail(normalizedEmail);
       if (existing) {
         return res.status(409).json({
           success: false,
@@ -78,7 +102,17 @@ const SiteUserController = {
       }
 
       const hashedPassword = await bcrypt.hash(password, 12);
-      const user = await SiteUserModel.create({ fullname, email, password: hashedPassword, moduleAccess });
+      const user = await SiteUserModel.create({
+        fullname: fullname.trim(),
+        email: normalizedEmail,
+        password: hashedPassword,
+        moduleAccess,
+        role: role || 'employee',
+        phone: phone || null,
+        department: department || null,
+        designation: designation || null,
+        mustChangePassword: 1, // PRD mandatory first-login password change
+      });
 
       return res.status(201).json({
         success: true,
@@ -86,6 +120,12 @@ const SiteUserController = {
         data: user,
       });
     } catch (err) {
+      if (err.code === 'ER_DUP_ENTRY') {
+        return res.status(409).json({
+          success: false,
+          message: 'A site user with this email already exists.',
+        });
+      }
       next(err);
     }
   },
@@ -93,12 +133,23 @@ const SiteUserController = {
   /**
    * PUT /api/user-master/:userId
    * Update a site-user (admin only).
-   * Example: PUT /api/user-master/tbusr001
-   * Body: any subset of { fullname, email, password, moduleAccess, is_active }
+   * Example: PUT /api/user-master/TBS001
+   * Body: any subset of { fullname, email, password, moduleAccess, is_active, phone, role, department, designation, must_change_password }
    */
   async update(req, res, next) {
     try {
-      const { fullname, email, password, moduleAccess, is_active } = req.body;
+      const {
+        fullname,
+        email,
+        password,
+        moduleAccess,
+        is_active,
+        must_change_password,
+        phone,
+        role,
+        department,
+        designation,
+      } = req.body || {};
       const { userId } = req.params;
 
       // Validate moduleAccess if provided
@@ -122,7 +173,8 @@ const SiteUserController = {
 
       // If email is changing, ensure it's not already taken by another user
       if (email !== undefined) {
-        const existing = await SiteUserModel.findByEmail(email);
+        const normalizedEmail = email.toLowerCase().trim();
+        const existing = await SiteUserModel.findByEmail(normalizedEmail);
         if (existing && existing.user_id !== userId) {
           return res.status(409).json({
             success: false,
@@ -143,6 +195,11 @@ const SiteUserController = {
         password: hashedPassword,
         moduleAccess,
         is_active,
+        must_change_password,
+        phone,
+        role,
+        department,
+        designation,
       });
 
       if (!updated) {
@@ -151,6 +208,12 @@ const SiteUserController = {
 
       return res.json({ success: true, message: 'Site user updated successfully.' });
     } catch (err) {
+      if (err.code === 'ER_DUP_ENTRY') {
+        return res.status(409).json({
+          success: false,
+          message: 'This email is already in use by another site user.',
+        });
+      }
       next(err);
     }
   },

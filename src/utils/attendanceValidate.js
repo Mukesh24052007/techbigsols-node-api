@@ -174,6 +174,21 @@ function validateOfficeInput(body, isUpdate = false) {
   return out;
 }
 
+function isValidYmd(ymd) {
+  if (typeof ymd !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return false;
+  const parts = ymd.split('-');
+  const y = Number(parts[0]);
+  const m = Number(parts[1]);
+  const d = Number(parts[2]);
+  if (m < 1 || m > 12 || d < 1 || d > 31) return false;
+  const dateObj = new Date(Date.UTC(y, m - 1, d));
+  return (
+    dateObj.getUTCFullYear() === y &&
+    dateObj.getUTCMonth() === m - 1 &&
+    dateObj.getUTCDate() === d
+  );
+}
+
 module.exports = {
   httpError,
   finiteNumber,
@@ -183,4 +198,5 @@ module.exports = {
   parseMonth,
   parseIsoDate,
   validateOfficeInput,
+  isValidYmd,
 };

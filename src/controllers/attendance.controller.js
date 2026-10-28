@@ -10,6 +10,7 @@ const {
   parseMonth,
   parseIsoDate,
   validateOfficeInput,
+  isValidYmd,
 } = require('../utils/attendanceValidate');
 const { haversineMetres } = require('../utils/geo');
 const { encryptEmbedding } = require('../utils/crypto');
@@ -52,6 +53,7 @@ const AttendanceAuditLogModel = require('../models/attendanceAuditLog.model');
 const AttendanceLeaveModel = require('../models/attendanceLeave.model');
 const AttendanceAttemptModel = require('../models/attendanceAttempt.model');
 const SiteUserModel = require('../models/siteUser.model');
+const QrSessionService = require('../services/qrSessionService');
 
 // Map of adminId -> number of active SSE streams
 const activeAdminStreams = new Map();
@@ -1685,6 +1687,497 @@ const AttendanceController = {
       return res.status(200).json({
         success: true,
         message: 'Leave cancelled successfully',
+      });
+    } catch (err) {
+      next(err);
+    }
+  },
+
+  // ── Phase 3: Attendance 2.0 QR Session & Check-In Endpoints ────────────────
+
+  /**
+   * POST /api/attendance/admin/qr/generate
+   * Generates or idempotently retrieves an active QR session for today.
+   */
+  async adminQrGenerate(req, res, next) {
+    try {
+      const { action, officeId, validityMinutes, allowRotation, rotationReason } = req.body || {};
+      if (!action || !['CHECK_IN', 'CHECK_OUT'].includes(action)) {
+        return res.status(400).json({
+          success: false,
+          message: 'action is required and must be either CHECK_IN or CHECK_OUT.',
+        });
+      }
+
+      const result = await QrSessionService.getOrCreateSession({
+        adminId: req.admin.id,
+        action,
+        officeId: officeId ? Number(officeId) : 1,
+        validityMinutes: validityMinutes ? Number(validityMinutes) : 15,
+        allowRotation: Boolean(allowRotation),
+        rotationReason,
+      });
+
+      return res.status(201).json({
+        success: true,
+        message: result.rotated
+          ? 'QR session rotated successfully.'
+          : (result.alreadyActive ? 'Existing active QR session returned.' : 'QR session generated successfully.'),
+        data: result,
+      });
+    } catch (err) {
+      if (err.statusCode) {
+        return res.status(err.statusCode).json({
+          success: false,
+          code: err.code,
+          message: err.message,
+        });
+      }
+      next(err);
+    }
+  },
+
+  /**
+   * GET /api/attendance/admin/qr/active
+   * Retrieves the active QR session, decrypting the token for office display reload.
+   */
+  async adminQrGetActive(req, res, next) {
+    try {
+      const { action, officeId } = req.query;
+      if (!action || !['CHECK_IN', 'CHECK_OUT'].includes(action)) {
+        return res.status(400).json({
+          success: false,
+          message: 'action query param is required and must be CHECK_IN or CHECK_OUT.',
+        });
+      }
+
+      const session = await QrSessionService.getActiveSession({
+        officeId: officeId ? Number(officeId) : 1,
+        action,
+      });
+
+      return res.status(200).json({
+        success: true,
+        data: session,
+      });
+    } catch (err) {
+      next(err);
+    }
+  },
+
+  /**
+   * POST /api/attendance/qr/check-in
+   * Employee scans and submits Check-In QR code.
+   */
+  async qrCheckIn(req, res, next) {
+    let conn = null;
+    try {
+      const { qrToken, lat, lng, accuracy } = req.body || {};
+      if (!qrToken || typeof qrToken !== 'string') {
+        return res.status(400).json({
+          success: false,
+          message: 'qrToken is required.',
+        });
+      }
+
+      // 1. Authenticated employee identity exclusively
+      const userId = req.siteUser.user_id;
+      const fullname = req.siteUser.fullname;
+
+      // 2. Validate token on server
+      const tokenCheck = await QrSessionService.validateToken({
+        rawToken: qrToken,
+        expectedAction: 'CHECK_IN',
+      });
+
+      if (!tokenCheck.valid) {
+        return res.status(400).json({
+          success: false,
+          code: tokenCheck.code,
+          message: tokenCheck.message,
+        });
+      }
+
+      const qrSession = tokenCheck.session;
+      const attendanceDate = qrSession.attendance_date; // Server-validated IST date
+      const officeId = qrSession.office_id;
+      const nowUtc = toUtcDateTime(new Date());
+
+      // 3. Transactional check-in with row-lock and unique constraint protection
+      conn = await pool.getConnection();
+      await conn.beginTransaction();
+
+      // Check if employee already has a record for today
+      const existing = await AttendanceRecordModel.findByUserDateForUpdate(conn, userId, attendanceDate);
+      if (existing && existing.check_in_at != null) {
+        await conn.rollback();
+        return res.status(409).json({
+          success: false,
+          message: 'Duplicate Check-In: attendance already recorded for today',
+        });
+      }
+
+      let recordId = null;
+      if (existing) {
+        // Record exists (e.g. marked absent previously) -> update with check-in
+        await conn.query(
+          `UPDATE attendance_records
+           SET check_in_at = ?, status = 'PRESENT', office_id = ?,
+               check_in_lat = ?, check_in_lng = ?, check_in_accuracy = ?,
+               updated_at = ?
+           WHERE id = ?`,
+          [nowUtc, officeId, lat || null, lng || null, accuracy || null, nowUtc, existing.id]
+        );
+        recordId = existing.id;
+      } else {
+        // Insert new record
+        try {
+          const [insertRes] = await conn.query(
+            `INSERT INTO attendance_records
+               (user_id, attendance_date, fullname, office_id, check_in_at, status, worked_minutes,
+                check_in_lat, check_in_lng, check_in_accuracy, ip, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, 'PRESENT', 0, ?, ?, ?, ?, ?, ?)`,
+            [
+              userId,
+              attendanceDate,
+              fullname,
+              officeId,
+              nowUtc,
+              lat || null,
+              lng || null,
+              accuracy || null,
+              req.ip || null,
+              nowUtc,
+              nowUtc,
+            ]
+          );
+          recordId = insertRes.insertId;
+        } catch (insertErr) {
+          if (insertErr.code === 'ER_DUP_ENTRY') {
+            await conn.rollback();
+            return res.status(409).json({
+              success: false,
+              message: 'Duplicate Check-In: attendance already recorded for today',
+            });
+          }
+          throw insertErr;
+        }
+      }
+
+      await conn.commit();
+
+      return res.status(200).json({
+        success: true,
+        message: 'Check-In recorded successfully.',
+        data: {
+          recordId,
+          userId,
+          attendanceDate,
+          checkInAt: nowUtc,
+          status: 'PRESENT',
+        },
+      });
+    } catch (err) {
+      if (conn) await conn.rollback().catch(() => {});
+      next(err);
+    } finally {
+      if (conn) conn.release();
+    }
+  },
+
+  /**
+   * POST /api/attendance/qr/check-out
+   * Employee scans and submits Check-Out QR code.
+   */
+  async qrCheckOut(req, res, next) {
+    let conn = null;
+    try {
+      const { qrToken, lat, lng, accuracy } = req.body || {};
+      if (!qrToken || typeof qrToken !== 'string') {
+        return res.status(400).json({
+          success: false,
+          message: 'qrToken is required.',
+        });
+      }
+
+      // 1. Authenticated employee identity exclusively
+      const userId = req.siteUser.user_id;
+
+      // 2. Validate token on server
+      const tokenCheck = await QrSessionService.validateToken({
+        rawToken: qrToken,
+        expectedAction: 'CHECK_OUT',
+      });
+
+      if (!tokenCheck.valid) {
+        return res.status(400).json({
+          success: false,
+          code: tokenCheck.code,
+          message: tokenCheck.message,
+        });
+      }
+
+      const qrSession = tokenCheck.session;
+      const attendanceDate = qrSession.attendance_date; // Server-validated IST date
+      const now = new Date();
+      const nowUtc = toUtcDateTime(now);
+
+      // 3. Transactional checkout with row locking
+      conn = await pool.getConnection();
+      await conn.beginTransaction();
+
+      const record = await AttendanceRecordModel.findByUserDateForUpdate(conn, userId, attendanceDate);
+
+      if (!record || record.check_in_at == null) {
+        await conn.rollback();
+        return res.status(400).json({
+          success: false,
+          message: 'Check-Out rejected: no active Check-In found for today',
+        });
+      }
+
+      if (record.check_out_at != null) {
+        await conn.rollback();
+        return res.status(409).json({
+          success: false,
+          message: 'Duplicate Check-Out: check-out already completed for this session',
+        });
+      }
+
+      // Compute worked minutes from server timestamps
+      const checkInDate = fromUtcDateTime(record.check_in_at);
+      const workedMinutes = checkInDate
+        ? Math.max(0, Math.round((now.getTime() - checkInDate.getTime()) / 60000))
+        : 0;
+
+      await conn.query(
+        `UPDATE attendance_records
+         SET check_out_at = ?, worked_minutes = ?,
+             check_out_lat = ?, check_out_lng = ?, check_out_accuracy = ?,
+             updated_at = ?
+         WHERE id = ?`,
+        [nowUtc, workedMinutes, lat || null, lng || null, accuracy || null, nowUtc, record.id]
+      );
+
+      await conn.commit();
+
+      return res.status(200).json({
+        success: true,
+        message: 'Check-Out recorded successfully.',
+        data: {
+          recordId: record.id,
+          userId,
+          attendanceDate,
+          checkInAt: record.check_in_at,
+          checkOutAt: nowUtc,
+          workedMinutes,
+          status: record.status,
+        },
+      });
+    } catch (err) {
+      if (conn) await conn.rollback().catch(() => {});
+      next(err);
+    } finally {
+      if (conn) conn.release();
+    }
+  },
+
+  /**
+   * GET /api/attendance/me/history
+   * Personal attendance history for authenticated employee.
+   */
+  async getHistory(req, res, next) {
+    try {
+      const userId = req.siteUser.user_id;
+      const { startDate, endDate, limit, offset } = req.query;
+
+      const records = await AttendanceRecordModel.listUserHistory({
+        userId,
+        startDate: startDate || null,
+        endDate: endDate || null,
+        limit: limit ? Number(limit) : 30,
+        offset: offset ? Number(offset) : 0,
+      });
+
+      return res.status(200).json({
+        success: true,
+        data: records,
+      });
+    } catch (err) {
+      next(err);
+    }
+  },
+
+  /**
+   * GET /api/attendance/admin/daily-logs
+   * Admin paginated daily attendance logs.
+   */
+  async adminGetDailyLogs(req, res, next) {
+    try {
+      const { date, status, officeId, page, limit } = req.query;
+      const targetDate = date || istCalendarDate();
+
+      const result = await AttendanceRecordModel.listDailyLogs({
+        date: targetDate,
+        status: status || null,
+        officeId: officeId || null,
+        page: page ? Number(page) : 1,
+        limit: limit ? Number(limit) : 50,
+      });
+
+      return res.status(200).json({
+        success: true,
+        data: {
+          date: targetDate,
+          ...result,
+        },
+      });
+    } catch (err) {
+      next(err);
+    }
+  },
+
+  /**
+   * POST /api/attendance/admin/manual-override
+   * Administrator manual override for an employee's attendance on a business date.
+   * Body: { userId, attendanceDate, status, reason }
+   * Status values accepted: exactly 'PRESENT' and 'ABSENT'.
+   */
+  async adminManualOverride(req, res, next) {
+    const adminId = req.admin?.id;
+    if (!adminId) {
+      return res.status(401).json({
+        success: false,
+        message: 'Admin authorization required.',
+      });
+    }
+
+    const { userId, attendanceDate, status, reason } = req.body || {};
+
+    // 1. Validate userId
+    if (!userId || typeof userId !== 'string' || !userId.trim()) {
+      return res.status(400).json({
+        success: false,
+        message: 'userId is required and must be a non-empty string.',
+      });
+    }
+    const trimmedUserId = userId.trim();
+
+    // Verify employee exists in site_users (supports both legacy tbusr... and TBS...)
+    const employee = await SiteUserModel.findById(trimmedUserId);
+    if (!employee) {
+      return res.status(404).json({
+        success: false,
+        message: `Employee "${trimmedUserId}" not found.`,
+      });
+    }
+
+    // 2. Validate attendanceDate (strict YYYY-MM-DD calendar date)
+    if (!attendanceDate || typeof attendanceDate !== 'string' || !isValidYmd(attendanceDate)) {
+      return res.status(400).json({
+        success: false,
+        message: 'attendanceDate must be a valid calendar date in YYYY-MM-DD format.',
+      });
+    }
+
+    // 3. Validate status: exactly 'PRESENT' or 'ABSENT'
+    if (status !== 'PRESENT' && status !== 'ABSENT') {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid status. Status must be exactly "PRESENT" or "ABSENT".',
+      });
+    }
+
+    // 4. Validate reason
+    if (!reason || typeof reason !== 'string' || !reason.trim()) {
+      return res.status(400).json({
+        success: false,
+        message: 'A non-empty reason is required for manual override.',
+      });
+    }
+    const trimmedReason = reason.trim();
+    if (trimmedReason.length > 255) {
+      return res.status(400).json({
+        success: false,
+        message: 'reason must not exceed 255 characters.',
+      });
+    }
+
+    // 5. Transactional execution
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+
+      const { recordId, beforeState, afterState } = await AttendanceRecordModel.applyManualOverride(conn, {
+        userId: employee.user_id,
+        attendanceDate,
+        fullname: employee.fullname,
+        status,
+        reason: trimmedReason,
+        adminId,
+      });
+
+      // 6. Audit entry creation within same transaction
+      await AttendanceAuditLogModel.log(
+        {
+          actorAdminId: adminId,
+          action: 'MANUAL_OVERRIDE',
+          entityType: 'attendance_record',
+          entityId: recordId,
+          beforeJson: beforeState,
+          afterJson: {
+            ...afterState,
+            reason: trimmedReason,
+            override_by: adminId,
+          },
+        },
+        conn
+      );
+
+      await conn.commit();
+
+      return res.status(200).json({
+        success: true,
+        message: `Attendance status manually set to ${status} for ${employee.user_id} on ${attendanceDate}.`,
+        data: {
+          record: afterState,
+          override: {
+            isManualOverride: true,
+            status,
+            reason: trimmedReason,
+            overrideBy: adminId,
+            previousStatus: beforeState?.status || null,
+          },
+        },
+      });
+    } catch (err) {
+      await conn.rollback();
+      next(err);
+    } finally {
+      conn.release();
+    }
+  },
+
+  /**
+   * GET /api/attendance/admin/audit-logs
+   * Admin paginated audit trail query with optional filtering.
+   * Query params: entityType, action, actorAdminId, page, limit
+   */
+  async adminGetAuditLogs(req, res, next) {
+    try {
+      const { entityType, action, actorAdminId, page, limit } = req.query;
+
+      const result = await AttendanceAuditLogModel.listLogs({
+        entityType: entityType ? String(entityType).trim() : null,
+        action: action ? String(action).trim() : null,
+        actorAdminId: actorAdminId ? Number(actorAdminId) : null,
+        page: page ? Number(page) : 1,
+        limit: limit ? Number(limit) : 50,
+      });
+
+      return res.status(200).json({
+        success: true,
+        data: result,
       });
     } catch (err) {
       next(err);

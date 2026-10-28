@@ -18,7 +18,6 @@ const app = express();
 const allowedOrigins = [
   'https://techbigsolutions.in',
   'https://www.techbigsolutions.in',
-  'http://localhost:3000'
 ];
 
 if (process.env.EXTRA_ALLOWED_ORIGINS) {

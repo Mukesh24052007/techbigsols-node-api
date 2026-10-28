@@ -21,7 +21,17 @@ router.post('/check-out', employeeGuard, AttendanceController.checkOut);
 router.get('/me/history', employeeGuard, AttendanceController.getHistory);
 router.post('/regularization', employeeGuard, AttendanceController.requestRegularization);
 
+// Attendance 2.0: QR Check-In & Check-Out
+router.post('/qr/check-in', employeeGuard, AttendanceController.qrCheckIn);
+router.post('/qr/check-out', employeeGuard, AttendanceController.qrCheckOut);
+
 // ── Admin Routes (admin JWT) ───────────────────────────────────────────────
+// Attendance 2.0: QR Session Management, Daily Logs, Manual Overrides & Audit Trail
+router.post('/admin/qr/generate', protect, AttendanceController.adminQrGenerate);
+router.get('/admin/qr/active', protect, AttendanceController.adminQrGetActive);
+router.get('/admin/daily-logs', protect, AttendanceController.adminGetDailyLogs);
+router.post('/admin/manual-override', protect, AttendanceController.adminManualOverride);
+router.get('/admin/audit-logs', protect, AttendanceController.adminGetAuditLogs);
 // Face enrollment
 router.post('/admin/employees/:userId/face', protect, AttendanceController.adminEnrolFace);
 router.delete('/admin/employees/:userId/face', protect, AttendanceController.adminDeleteFace);

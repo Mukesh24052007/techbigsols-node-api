@@ -59,6 +59,28 @@ const siteUserProtect = async (req, res, next) => {
 
     // Attach the site-user to the request for downstream use
     req.siteUser = siteUser;
+
+    // Server-side enforcement of mandatory first-login password change
+    if (siteUser.mustChangePassword) {
+      const fullPath = (req.baseUrl || '') + (req.path || '');
+      const allowedPaths = [
+        '/api/site-auth/change-password',
+        '/api/site-auth/logout',
+        '/api/site-auth/me',
+        '/change-password',
+        '/logout',
+        '/me',
+      ];
+      const isAllowed = allowedPaths.some((p) => fullPath.endsWith(p));
+      if (!isAllowed) {
+        return res.status(403).json({
+          success: false,
+          code: 'PASSWORD_CHANGE_REQUIRED',
+          message: 'You must change your password before accessing this resource.',
+        });
+      }
+    }
+
     next();
   } catch (err) {
     next(err);

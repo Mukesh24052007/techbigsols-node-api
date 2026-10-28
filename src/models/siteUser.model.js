@@ -1,4 +1,5 @@
 const { pool } = require('../config/db');
+const { toUtcDateTime } = require('../utils/time');
 
 /**
  * Valid module access options — kept here as the single source of truth.
@@ -17,41 +18,88 @@ const MODULES = [
 ];
 
 /**
- * Generate the next user_id in the format tbusr001, tbusr002, …
- * Reads the highest existing numeric suffix and increments by 1.
- * Uses a transaction-safe SELECT … FOR UPDATE to prevent duplicates
- * under concurrent inserts.
+ * Concurrency-safe sequential employee ID allocator using app_sequences table.
+ * Allocates IDs in the format: TBS001, TBS002, TBS003, …
+ * Uses SELECT … FOR UPDATE on the 'employee_id' sequence row to serialize allocation.
+ * Reconciles against any existing TBS IDs in site_users to prevent gaps or collisions.
+ * Preserves all legacy tbusr… IDs without rewriting them.
  *
- * @param {object} conn - An active pool connection
- * @returns {string}
+ * @param {object} conn - An active database connection
+ * @returns {Promise<string>}
  */
 async function generateUserId(conn) {
-  const [rows] = await conn.query(
-    `SELECT user_id FROM site_users ORDER BY user_id DESC LIMIT 1 FOR UPDATE`
-  );
+  const needsOwnConn = !conn;
+  const connection = needsOwnConn ? await pool.getConnection() : conn;
+  const now = toUtcDateTime();
 
-  let next = 1;
-  if (rows.length > 0) {
-    // user_id format: tbusr001  → extract trailing digits
-    const last = rows[0].user_id; // e.g. "tbusr007"
-    const num = parseInt(last.replace(/^tbusr/, ''), 10);
-    if (!isNaN(num)) next = num + 1;
+  try {
+    if (needsOwnConn) {
+      await connection.beginTransaction();
+    }
+
+    // 1. Ensure sequence row exists in app_sequences
+    await connection.query(
+      `INSERT INTO app_sequences (sequence_name, current_val, updated_at)
+       VALUES ('employee_id', 0, ?)
+       ON DUPLICATE KEY UPDATE sequence_name = sequence_name`,
+      [now]
+    );
+
+    // 2. Acquire exclusive row lock on 'employee_id'
+    const [seqRows] = await connection.query(
+      `SELECT current_val FROM app_sequences WHERE sequence_name = 'employee_id' FOR UPDATE`
+    );
+
+    let currentVal = Number(seqRows[0]?.current_val || 0);
+
+    // 3. Reconcile with any existing TBS IDs in site_users
+    const [tbsRows] = await connection.query(
+      `SELECT MAX(CAST(SUBSTRING(user_id, 4) AS UNSIGNED)) AS max_val
+       FROM site_users
+       WHERE user_id REGEXP '^TBS[0-9]+'`
+    );
+    const maxExisting = Number(tbsRows[0]?.max_val || 0);
+    if (maxExisting > currentVal) {
+      currentVal = maxExisting;
+    }
+
+    // 4. Increment sequence
+    const nextVal = currentVal + 1;
+    await connection.query(
+      `UPDATE app_sequences SET current_val = ?, updated_at = ? WHERE sequence_name = 'employee_id'`,
+      [nextVal, now]
+    );
+
+    if (needsOwnConn) {
+      await connection.commit();
+    }
+
+    const padded = String(nextVal).padStart(3, '0');
+    return `TBS${padded}`;
+  } catch (err) {
+    if (needsOwnConn) {
+      await connection.rollback();
+    }
+    throw err;
+  } finally {
+    if (needsOwnConn) {
+      connection.release();
+    }
   }
-
-  // Zero-pad to at least 3 digits (grows naturally beyond 999)
-  const padded = String(next).padStart(3, '0');
-  return `tbusr${padded}`;
 }
 
 const SiteUserModel = {
   MODULES,
+  generateUserId,
 
   /**
    * Return all site-users (password excluded).
    */
   async findAll() {
     const [rows] = await pool.query(
-      `SELECT user_id, fullname, email, module_access, is_active, created_at, updated_at
+      `SELECT user_id, fullname, email, module_access, is_active,
+              must_change_password, role, phone, department, designation,
+              created_at, updated_at
        FROM site_users
        ORDER BY user_id ASC`
     );
@@ -63,7 +111,9 @@ const SiteUserModel = {
    */
   async findById(userId) {
     const [rows] = await pool.query(
-      `SELECT user_id, fullname, email, module_access, is_active, created_at, updated_at
+      `SELECT user_id, fullname, email, module_access, is_active,
+              must_change_password, role, phone, department, designation,
+              created_at, updated_at
        FROM site_users WHERE user_id = ?`,
       [userId]
     );
@@ -72,38 +122,76 @@ const SiteUserModel = {
 
   /**
    * Find a site-user by email — includes password (used for auth only).
+   * Performs case-insensitive matching.
    */
   async findByEmail(email) {
+    if (!email || typeof email !== 'string') return null;
     const [rows] = await pool.query(
-      `SELECT user_id, fullname, email, password, module_access, is_active
-       FROM site_users WHERE email = ?`,
-      [email]
+      `SELECT user_id, fullname, email, password, module_access, is_active,
+              must_change_password, role, phone, department, designation,
+              created_at, updated_at
+       FROM site_users WHERE LOWER(email) = LOWER(?)`,
+      [email.trim()]
     );
     return rows[0] ? SiteUserModel._parse(rows[0]) : null;
   },
 
   /**
-   * Create a new site-user with an auto-generated user_id.
-   * Runs inside a transaction to guarantee unique id generation.
+   * Create a new site-user with sequential TBS ID.
+   * Runs inside a transaction to guarantee atomic, collision-free id generation.
    *
-   * @param {object} data - { fullname, email, password (hashed), moduleAccess[] }
-   * @returns {object} - { userId, fullname, email, moduleAccess }
+   * @param {object} data
+   * @returns {Promise<object>}
    */
-  async create({ fullname, email, password, moduleAccess = [] }) {
+  async create({
+    fullname,
+    email,
+    password,
+    moduleAccess = [],
+    role = 'employee',
+    phone = null,
+    department = null,
+    designation = null,
+    mustChangePassword = 1,
+  }) {
     const conn = await pool.getConnection();
     try {
       await conn.beginTransaction();
 
       const userId = await generateUserId(conn);
+      const normalizedEmail = email.toLowerCase().trim();
 
       await conn.query(
-        `INSERT INTO site_users (user_id, fullname, email, password, module_access)
-         VALUES (?, ?, ?, ?, ?)`,
-        [userId, fullname, email, password, JSON.stringify(moduleAccess)]
+        `INSERT INTO site_users
+           (user_id, fullname, email, password, module_access, is_active,
+            must_change_password, role, phone, department, designation)
+         VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)`,
+        [
+          userId,
+          fullname.trim(),
+          normalizedEmail,
+          password,
+          JSON.stringify(moduleAccess),
+          mustChangePassword ? 1 : 0,
+          role || 'employee',
+          phone || null,
+          department || null,
+          designation || null,
+        ]
       );
 
       await conn.commit();
-      return { userId, fullname, email, moduleAccess };
+      return {
+        userId,
+        fullname: fullname.trim(),
+        email: normalizedEmail,
+        role: role || 'employee',
+        phone: phone || null,
+        department: department || null,
+        designation: designation || null,
+        moduleAccess,
+        mustChangePassword: Boolean(mustChangePassword),
+      };
     } catch (err) {
       await conn.rollback();
       throw err;
@@ -116,15 +204,61 @@ const SiteUserModel = {
    * Update an existing site-user.
    * Only supplied fields are changed; password update is optional.
    */
-  async update(userId, { fullname, email, password, moduleAccess, is_active }) {
+  async update(userId, {
+    fullname,
+    email,
+    password,
+    moduleAccess,
+    is_active,
+    must_change_password,
+    role,
+    phone,
+    department,
+    designation,
+  }) {
     const fields = [];
     const values = [];
 
-    if (fullname !== undefined)     { fields.push('fullname = ?');      values.push(fullname); }
-    if (email !== undefined)        { fields.push('email = ?');         values.push(email); }
-    if (password !== undefined)     { fields.push('password = ?');      values.push(password); }
-    if (moduleAccess !== undefined) { fields.push('module_access = ?'); values.push(JSON.stringify(moduleAccess)); }
-    if (is_active !== undefined)    { fields.push('is_active = ?');     values.push(is_active ? 1 : 0); }
+    if (fullname !== undefined) {
+      fields.push('fullname = ?');
+      values.push(fullname.trim());
+    }
+    if (email !== undefined) {
+      fields.push('email = ?');
+      values.push(email.toLowerCase().trim());
+    }
+    if (password !== undefined) {
+      fields.push('password = ?');
+      values.push(password);
+    }
+    if (moduleAccess !== undefined) {
+      fields.push('module_access = ?');
+      values.push(JSON.stringify(moduleAccess));
+    }
+    if (is_active !== undefined) {
+      fields.push('is_active = ?');
+      values.push(is_active ? 1 : 0);
+    }
+    if (must_change_password !== undefined) {
+      fields.push('must_change_password = ?');
+      values.push(must_change_password ? 1 : 0);
+    }
+    if (role !== undefined) {
+      fields.push('role = ?');
+      values.push(role);
+    }
+    if (phone !== undefined) {
+      fields.push('phone = ?');
+      values.push(phone);
+    }
+    if (department !== undefined) {
+      fields.push('department = ?');
+      values.push(department);
+    }
+    if (designation !== undefined) {
+      fields.push('designation = ?');
+      values.push(designation);
+    }
 
     if (fields.length === 0) return false;
 
@@ -148,9 +282,7 @@ const SiteUserModel = {
   },
 
   /**
-   * Parse the JSON module_access column and normalise the id field.
-   * Exposes user_id as both `userId` (camelCase) and keeps `user_id` for
-   * internal use; strips the raw `module_access` column from the result.
+   * Parse the JSON module_access column and normalise fields.
    * @private
    */
   _parse(row) {
@@ -163,8 +295,17 @@ const SiteUserModel = {
     } catch {
       moduleAccess = [];
     }
-    const { module_access, ...rest } = row;
-    return { ...rest, moduleAccess };
+    const { module_access, must_change_password, ...rest } = row;
+    return {
+      userId: row.user_id,
+      ...rest,
+      moduleAccess,
+      mustChangePassword: Boolean(must_change_password),
+      role: row.role || 'employee',
+      phone: row.phone || null,
+      department: row.department || null,
+      designation: row.designation || null,
+    };
   },
 };
 

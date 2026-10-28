@@ -36,6 +36,20 @@ const tableExists = async (table) => {
   return rows.length > 0;
 };
 
+// ── Helper: check if an index exists ──────────────────────────────────────────
+const indexExists = async (table, indexName) => {
+  const [rows] = await pool.query(
+    `SELECT 1
+     FROM INFORMATION_SCHEMA.STATISTICS
+     WHERE TABLE_SCHEMA = DATABASE()
+       AND TABLE_NAME   = ?
+       AND INDEX_NAME   = ?
+     LIMIT 1`,
+    [table, indexName]
+  );
+  return rows.length > 0;
+};
+
 const migrate = async () => {
   try {
 
@@ -527,13 +541,150 @@ const migrate = async () => {
       console.warn('⚠️  attendance_reverify_tasks: could not modify status column —', err.message);
     }
 
+    // ── 6. Attendance 2.0: app_sequences for concurrency-safe ID allocation ────
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS app_sequences (
+        sequence_name VARCHAR(64) NOT NULL PRIMARY KEY,
+        current_val   BIGINT      NOT NULL DEFAULT 0,
+        updated_at    DATETIME    NOT NULL
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    `);
+    console.log('✅ app_sequences table ready');
+
+    // Seed employee_id sequence if not already present
+    try {
+      const [seqRows] = await pool.query(
+        `SELECT current_val FROM app_sequences WHERE sequence_name = 'employee_id' LIMIT 1`
+      );
+      if (seqRows.length === 0) {
+        // Inspect site_users for any existing TBSxxx numbers
+        let initialVal = 0;
+        try {
+          const [tbsRows] = await pool.query(`
+            SELECT MAX(CAST(SUBSTRING(user_id, 4) AS UNSIGNED)) AS max_val
+            FROM site_users
+            WHERE user_id REGEXP '^TBS[0-9]+'
+          `);
+          if (tbsRows.length > 0 && tbsRows[0].max_val != null) {
+            initialVal = Number(tbsRows[0].max_val) || 0;
+          }
+        } catch (_) {}
+
+        await pool.query(
+          `INSERT INTO app_sequences (sequence_name, current_val, updated_at)
+           VALUES ('employee_id', ?, UTC_TIMESTAMP())`,
+          [initialVal]
+        );
+        console.log(`✅ app_sequences: initialized employee_id sequence at ${initialVal}`);
+      }
+    } catch (err) {
+      console.warn('⚠️  app_sequences initialization:', err.message);
+    }
+
+    // ── 7. Attendance 2.0: attendance_qr_sessions table ─────────────────────────
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS attendance_qr_sessions (
+        id                  INT AUTO_INCREMENT PRIMARY KEY,
+        session_token_hash  VARCHAR(64)   NOT NULL,
+        encrypted_token     VARCHAR(512)  DEFAULT NULL,
+        office_id           INT           NOT NULL DEFAULT 1,
+        attendance_date     DATE          NOT NULL,
+        action              ENUM('CHECK_IN', 'CHECK_OUT') NOT NULL,
+        generation_seq      INT           NOT NULL DEFAULT 1,
+        status              ENUM('ACTIVE', 'EXPIRED', 'REVOKED') NOT NULL DEFAULT 'ACTIVE',
+        created_by_admin_id INT           NOT NULL,
+        expires_at          DATETIME      NOT NULL,
+        revoked_at          DATETIME      DEFAULT NULL,
+        revoked_by_admin_id INT           DEFAULT NULL,
+        revocation_reason   VARCHAR(255)  DEFAULT NULL,
+        active_slot         VARCHAR(64)   DEFAULT NULL,
+        created_at          DATETIME      NOT NULL,
+        updated_at          DATETIME      NOT NULL,
+        UNIQUE KEY uq_qr_token_hash (session_token_hash),
+        UNIQUE KEY uq_qr_active_slot (active_slot),
+        INDEX idx_qr_date_action (office_id, attendance_date, action)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    `);
+    console.log('✅ attendance_qr_sessions table ready');
+
+    // Guarded upgrade: add encrypted_token if missing
+    try {
+      if (await tableExists('attendance_qr_sessions')) {
+        if (!(await columnExists('attendance_qr_sessions', 'encrypted_token'))) {
+          await pool.query(`ALTER TABLE attendance_qr_sessions ADD COLUMN encrypted_token VARCHAR(512) DEFAULT NULL AFTER session_token_hash`);
+          console.log('✅ attendance_qr_sessions: encrypted_token column added');
+        }
+      }
+    } catch (err) {
+      console.warn('⚠️  attendance_qr_sessions: could not add encrypted_token —', err.message);
+    }
+
+    // ── 8. Attendance 2.0: Guarded additions to site_users ─────────────────────
+    try {
+      if (await tableExists('site_users')) {
+        if (!(await columnExists('site_users', 'must_change_password'))) {
+          await pool.query(`ALTER TABLE site_users ADD COLUMN must_change_password TINYINT(1) NOT NULL DEFAULT 0 AFTER is_active`);
+          console.log('✅ site_users: must_change_password column added');
+        }
+        if (!(await columnExists('site_users', 'role'))) {
+          await pool.query(`ALTER TABLE site_users ADD COLUMN role VARCHAR(50) NOT NULL DEFAULT 'employee' AFTER must_change_password`);
+          console.log('✅ site_users: role column added');
+        }
+        if (!(await columnExists('site_users', 'phone'))) {
+          await pool.query(`ALTER TABLE site_users ADD COLUMN phone VARCHAR(20) DEFAULT NULL AFTER role`);
+          console.log('✅ site_users: phone column added');
+        }
+        if (!(await columnExists('site_users', 'department'))) {
+          await pool.query(`ALTER TABLE site_users ADD COLUMN department VARCHAR(100) DEFAULT NULL AFTER phone`);
+          console.log('✅ site_users: department column added');
+        }
+        if (!(await columnExists('site_users', 'designation'))) {
+          await pool.query(`ALTER TABLE site_users ADD COLUMN designation VARCHAR(100) DEFAULT NULL AFTER department`);
+          console.log('✅ site_users: designation column added');
+        }
+      }
+    } catch (err) {
+      console.warn('⚠️  site_users: could not add Phase 2 columns —', err.message);
+    }
+
+    // ── 9. Attendance 2.0: Guarded additions to attendance_records ─────────────
+    try {
+      if (await tableExists('attendance_records')) {
+        if (!(await columnExists('attendance_records', 'is_manual_override'))) {
+          await pool.query(`ALTER TABLE attendance_records ADD COLUMN is_manual_override TINYINT(1) NOT NULL DEFAULT 0 AFTER status`);
+          console.log('✅ attendance_records: is_manual_override column added');
+        }
+        if (!(await columnExists('attendance_records', 'override_reason'))) {
+          await pool.query(`ALTER TABLE attendance_records ADD COLUMN override_reason VARCHAR(255) DEFAULT NULL AFTER is_manual_override`);
+          console.log('✅ attendance_records: override_reason column added');
+        }
+        if (!(await columnExists('attendance_records', 'override_by'))) {
+          await pool.query(`ALTER TABLE attendance_records ADD COLUMN override_by INT DEFAULT NULL AFTER override_reason`);
+          console.log('✅ attendance_records: override_by column added');
+        }
+      }
+    } catch (err) {
+      console.warn('⚠️  attendance_records: could not add Phase 2 override columns —', err.message);
+    }
+
     console.log('\n🎉 All migrations completed successfully.');
-    process.exit(0);
+    return true;
 
   } catch (err) {
     console.error('❌ Migration failed:', err.message);
-    process.exit(1);
+    throw err;
   }
 };
 
-migrate();
+if (require.main === module) {
+  migrate()
+    .then(() => process.exit(0))
+    .catch(() => process.exit(1));
+}
+
+module.exports = {
+  migrate,
+  columnExists,
+  tableExists,
+  indexExists,
+};
